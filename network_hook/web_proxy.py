@@ -20,6 +20,9 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import urlparse, parse_qs
 
+from core_comm.analysis_events import record_analysis_result
+from core_comm.review_notifier import notify_review
+
 # Content-Type → 확장자 매핑 (업로드 파일 타입 추론용)
 _CT_TO_EXT: dict[str, str] = {
     "application/pdf":   ".pdf",
@@ -388,36 +391,24 @@ class _DLPAddon:
             result.action, result.confidence_score, flow.request.pretty_url,
         )
 
-        _extra = {
-            "event_id":       payload.request_id,
-            "url":            flow.request.pretty_url,
-            "ai_score":       result.confidence_score,
-            "reason":         result.reason,
-            "latency_ms":     int(result.latency_ms),
-            "detection_type": "RULE_BASED" if getattr(self._api, "is_mock", True) else "HYBRID",
-        }
-
-        if result.should_block:
-            self._event_logger.log(
+        try:
+            record_analysis_result(
+                self._event_logger,
+                result,
                 channel=channel,
-                action="blocked",
                 process_name=process_name,
                 hits=hits,
                 text=text,
-                extra=_extra,
+                event_id=payload.request_id,
+                detection_type="RULE_BASED" if getattr(self._api, "is_mock", True) else "HYBRID",
+                metadata={"url": flow.request.pretty_url},
             )
-            # 같은 호스트 60초 내 팝업 1회만 (재시도/동시다발 차단 팝업 폭탄 방지)
-            if self._on_blocked:
-                import time as _time
-                host = flow.request.pretty_host.lower()
-                now = _time.monotonic()
-                last = self._popup_cache.get(host, 0)
-                if now - last > self._POPUP_DEDUP_SEC:
-                    self._popup_cache[host] = now
-                    self._on_blocked(flow.request.pretty_url, hits, process_name)
-                else:
-                    logger.info("[WebProxy] 재시도 차단 (팝업 생략) url=%s", flow.request.pretty_url[:120])
+        except Exception:
+            # 로컬 저장소·대시보드 기록 장애는 AI 판정을 바꾸지 않는다.
+            logger.exception("[WebProxy] 분석 결과 기록 실패(판정 유지)")
 
+        if result.should_block:
+            # 차단 응답을 먼저 확정한다. 이후 팝업이 실패해도 451은 유지된다.
             pattern_names = ", ".join(h.get("name", h.get("id", "")) for h in hits)
             html = _BLOCK_HTML.format(
                 reason=result.reason or "민감정보 탐지",
@@ -432,19 +423,37 @@ class _DLPAddon:
                     "Cache-Control": "no-store",
                 },
             )
+
+            # 같은 호스트 60초 내 팝업 1회만 (재시도/동시다발 차단 팝업 폭탄 방지)
+            if self._on_blocked:
+                try:
+                    import time as _time
+                    host = flow.request.pretty_host.lower()
+                    now = _time.monotonic()
+                    last = self._popup_cache.get(host, 0)
+                    if now - last > self._POPUP_DEDUP_SEC:
+                        self._popup_cache[host] = now
+                        self._on_blocked(flow.request.pretty_url, hits, process_name)
+                    else:
+                        logger.info(
+                            "[WebProxy] 재시도 차단 (팝업 생략) url=%s",
+                            flow.request.pretty_url[:120],
+                        )
+                except Exception:
+                    logger.exception("[WebProxy] 차단 팝업 실패(451 차단 유지)")
             return
 
         if result.needs_review:
-            self._event_logger.log(
-                channel=channel,
-                action="review",
-                process_name=process_name,
-                hits=hits,
-                text=text,
-                extra=_extra,
-            )
+            try:
+                notify_review(channel, flow.request.pretty_url, hits)
+            except Exception:
+                logger.exception("[WebProxy] review 경고 실패(업로드 허용 유지)")
             logger.warning("[WebProxy] review 기록 — %s", flow.request.pretty_url)
-        # allow → 그대로 통과
+        elif result.analysis_failed:
+            logger.warning("[WebProxy] AI 장애 Fail-Open 기록 — 업로드 허용: %s", flow.request.pretty_url)
+        else:
+            logger.info("[WebProxy] AI allow 기록 — 업로드 허용: %s", flow.request.pretty_url)
+        # allow/review → 그대로 통과
 
     # ── 도메인 매칭 ──────────────────────────────────────────────────────────
 

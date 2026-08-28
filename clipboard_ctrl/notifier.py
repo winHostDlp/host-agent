@@ -10,6 +10,8 @@ import logging
 import threading
 from typing import Any
 
+from core_comm.review_notifier import notify_review as _notify_review
+
 logger = logging.getLogger(__name__)
 
 _MB_OK           = 0x00000000
@@ -119,3 +121,8 @@ def notify_blocked(process_name: str, hits: list[dict[str, Any]]) -> None:
         process_name,
         ", ".join(h.get("id", "?") for h in hits),
     )
+
+
+def notify_review(process_name: str, hits: list[dict[str, Any]]) -> None:
+    """Fire-and-forget: warn that a suspicious paste was allowed and recorded."""
+    _notify_review("clipboard", process_name, hits)

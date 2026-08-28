@@ -9,8 +9,8 @@
 파이프라인
   정규식(1차 게이트) → PayloadBuilder(정제) → ApiClient(AI 판단)
     → block  : 차단 + 팝업 + 로컬 JSONL 기록
-    → review : 허용 + 로컬 JSONL 기록 (추후 AI 판단 대기)
-    → allow  : 통과 (기록 없음)
+    → review : 사용자 경고 + 허용 + 로컬 JSONL/대시보드 기록
+    → allow  : 허용 + 로컬 JSONL/대시보드 기록
 
 AI 서버 설정 (settings.yaml)
   ai_base_url: ""        → mock 모드 (severity 기반 즉시 판단)
@@ -29,13 +29,16 @@ from typing import Any
 import yaml
 
 from clipboard_ctrl.clipboard_hook import ClipboardHook
-from clipboard_ctrl.notifier import notify_blocked
+from clipboard_ctrl.notifier import notify_blocked, notify_review as notify_clipboard_review
 from clipboard_ctrl.paste_inspector import PasteInspector
 from clipboard_ctrl.rule_filter import RuleFilter
+from core_comm.analysis_events import make_network_decision_handler
 from core_comm.api_client import ApiClient
+from core_comm.clipboard_analysis import run_clipboard_analysis
 from core_comm.event_logger import EventLogger
 from core_comm.local_store import LocalEventStore
 from core_comm.payload_builder import PayloadBuilder
+from core_comm.review_notifier import notify_review as notify_channel_review
 from network_hook.file_inspector import FileInspector
 from network_hook.proxy_cert import ProxyCert
 
@@ -122,55 +125,21 @@ def make_block_handler(
 
     Returns
     -------
-    on_detected(summary_or_text, hits, process_name) → None
+    on_detected(summary_or_text, hits, process_name) → "block" | "review" | "allow"
         네트워크 채널(Outlook, SMTP, HTTP)에서 사용.
     """
-    logger = logging.getLogger(__name__)
-
-    def on_detected(
-        text: str,
-        hits: list[dict[str, Any]],
-        process_name: str,
-    ) -> None:
-        payload = payload_builder.build(text, hits, channel, process_name)
-        result  = api_client.analyze(payload)
-
-        logger.info(
-            "[%s] AI 판단: action=%s confidence=%.2f reason=%s",
-            channel, result.action, result.confidence_score, result.reason,
-        )
-
-        _extra = {
-            "event_id":        payload.request_id,
-            "ai_score":        result.confidence_score,
-            "reason":          result.reason,
-            "latency_ms":      int(result.latency_ms),
-            "detection_type":  "RULE_BASED" if api_client.is_mock else "HYBRID",
-        }
-
-        if result.should_block:
-            notify_blocked(process_name, hits)
-            event_logger.log(
-                channel=channel,
-                action="blocked",
-                process_name=process_name,
-                hits=hits,
-                text=text,
-                extra=_extra,
-            )
-        elif result.needs_review:
-            event_logger.log(
-                channel=channel,
-                action="review",
-                process_name=process_name,
-                hits=hits,
-                text=text,
-                extra=_extra,
-            )
-            logger.warning("[%s] review 기록 — %s", channel, process_name)
-        # action == "allow" → 기록 없이 통과
-
-    return on_detected
+    # rule_filter는 채널 훅에서 이미 hits를 생성하는 구조라 콜백 내에서는
+    # 사용하지 않지만, 기존 빌더 API 호환성을 위해 인자를 유지한다.
+    _ = rule_filter
+    return make_network_decision_handler(
+        channel=channel,
+        event_logger=event_logger,
+        api_client=api_client,
+        payload_builder=payload_builder,
+        notify_blocked=notify_blocked,
+        notify_review=notify_channel_review,
+        logger=logging.getLogger(__name__),
+    )
 
 
 # ── 채널별 빌더 ────────────────────────────────────────────────────────────────
@@ -189,61 +158,40 @@ def build_clipboard_hook(
     # hook_ref: ClipboardHook 객체를 생성 후 바인딩 (순환 참조 없이 콜백에 전달)
     hook_ref: list[Any] = [None]
 
-    def on_text_pasted(text: str, process_name: str) -> bool:
+    def on_text_pasted(
+        text: str,
+        process_name: str,
+        clipboard_sequence: int,
+    ) -> bool:
         """True 반환 시 붙여넣기 차단.
 
         정규식 히트 즉시 차단 → AI 비동기 분석 →
-          block/review : 팝업 + 로그 (차단 유지)
-          allow        : 클립보드 복원 후 Ctrl+V 재발행 (오탐 복구)
+          block  : 팝업 + 로그 (차단 유지)
+          review : 기존 클립보드로 Ctrl+V 재발행 후 경고
+          allow  : 기존 클립보드로 Ctrl+V 재발행 (오탐/Fail-Open 복구)
         """
         hits = rule_filter.match(text)
         if not hits:
             return False
 
         def _ai_then_notify() -> None:
-            payload = payload_builder.build(text, hits, "clipboard", process_name)
-            result  = api_client.analyze(payload)
+            hook = hook_ref[0]
+            if hook is None:
+                logger.error("[clipboard] 훅 참조 없음 — 붙여넣기 복구 불가")
+                return
 
-            logger.info(
-                "[clipboard] AI 판단: action=%s confidence=%.2f reason=%s",
-                result.action, result.confidence_score, result.reason,
+            run_clipboard_analysis(
+                text=text,
+                process_name=process_name,
+                hits=hits,
+                payload_builder=payload_builder,
+                api_client=api_client,
+                event_logger=event_logger,
+                release_paste=lambda: hook.release_paste(clipboard_sequence),
+                notify_blocked=notify_blocked,
+                notify_review=notify_clipboard_review,
+                logger=logger,
             )
-
-            _extra = {
-                "event_id":       payload.request_id,
-                "ai_score":       result.confidence_score,
-                "reason":         result.reason,
-                "latency_ms":     int(result.latency_ms),
-                "detection_type": "RULE_BASED" if api_client.is_mock else "HYBRID",
-            }
-
-            if result.should_block:
-                notify_blocked(process_name, hits)
-                event_logger.log(
-                    channel="clipboard",
-                    action="blocked",
-                    process_name=process_name,
-                    hits=hits,
-                    text=text,
-                    extra=_extra,
-                )
-            elif result.needs_review:
-                notify_blocked(process_name, hits)
-                event_logger.log(
-                    channel="clipboard",
-                    action="review",
-                    process_name=process_name,
-                    hits=hits,
-                    text=text,
-                    extra=_extra,
-                )
-                logger.warning("[clipboard] review — 붙여넣기 차단 유지")
-            else:
-                # AI 허용 → 정규식 오탐. 클립보드 복원 후 붙여넣기 재발행.
-                logger.info("[clipboard] AI allow — 오탐 복구: 붙여넣기 재발행")
-                hook = hook_ref[0]
-                if hook is not None:
-                    hook.release_paste(text)
 
         threading.Thread(target=_ai_then_notify, daemon=True, name="ClipboardAI").start()
         return True  # 정규식 히트 즉시 차단

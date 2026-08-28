@@ -8,10 +8,11 @@
      LogCreate 포맷 맞춤 변환 후 비동기 전송.
 
 채널 → leak_channel 매핑
-  clipboard  → MESSENGER      (클립보드 붙여넣기)
+  clipboard  → CLIPBOARD
   outlook    → EMAIL_ATTACHMENT
   smtp       → EMAIL_ATTACHMENT
   web_mail   → WEB_UPLOAD
+  drive_upload → CLOUD_DRIVE
   http       → WEB_UPLOAD
   file_guard → USB_COPY
   usb        → USB_COPY
@@ -53,10 +54,11 @@ def _get_host_ip() -> str:
 # ── 채널·액션 매핑 ──────────────────────────────────────────────────────────
 
 _CHANNEL_TO_LEAK: dict[str, str] = {
-    "clipboard":  "MESSENGER",
+    "clipboard":  "CLIPBOARD",
     "outlook":    "EMAIL_ATTACHMENT",
     "smtp":       "EMAIL_ATTACHMENT",
     "web_mail":   "WEB_UPLOAD",
+    "drive_upload": "CLOUD_DRIVE",
     "http":       "WEB_UPLOAD",
     "file_guard": "USB_COPY",
     "usb":        "USB_COPY",
@@ -85,13 +87,14 @@ def _resolve_file_name(channel: str, process_name: str, extra: dict[str, Any]) -
     if channel in ("outlook", "smtp"):
         return "email_body"
 
-    if channel == "web_mail":
+    if channel in ("web_mail", "drive_upload"):
         url = str(extra.get("url", ""))
         try:
             host = urlparse(url).netloc
-            return f"web_upload@{host}"[:255] if host else "web_upload"
+            prefix = "cloud_drive" if channel == "drive_upload" else "web_upload"
+            return f"{prefix}@{host}"[:255] if host else prefix
         except Exception:
-            return "web_upload"
+            return "cloud_drive" if channel == "drive_upload" else "web_upload"
 
     # clipboard, http, messenger
     return (process_name or "clipboard_content")[:255]
@@ -197,8 +200,8 @@ class EventLogger:
                     record = json.loads(line)
                     # 로컬 레코드 → LogCreate 포맷 변환
                     payload = self._build_log_payload_from_record(record)
-                    self._post(payload)
-                    sent += 1
+                    if self._post(payload):
+                        sent += 1
                 except Exception as exc:
                     logger.warning("flush 중 오류 (건너뜀): %s", exc)
 
@@ -260,6 +263,7 @@ class EventLogger:
             "leak_channel":    leak_channel,
             "detection_type":  detection_type,
             "ai_score":        ai_score,
+            "model_version":   extra.get("model_version") or None,
             "matched_keywords": [h.get("id", "") for h in hits if h.get("id")],
             "policy_id":       None,
             "action_taken":    action_taken,
@@ -283,8 +287,8 @@ class EventLogger:
             extra=extra,
         )
 
-    def _post(self, payload: dict[str, Any]) -> None:
-        """단일 레코드를 대시보드 POST /api/v1/logs 로 전송한다. 실패는 로그만 남긴다."""
+    def _post(self, payload: dict[str, Any]) -> bool:
+        """단일 레코드를 대시보드로 전송하고 성공 여부를 반환한다."""
         url = f"{self._dashboard_url}/api/v1/logs"
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if self._token:
@@ -296,5 +300,7 @@ class EventLogger:
                 "Event posted → %s (%d) event_id=%s",
                 url, resp.status_code, payload.get("event_id"),
             )
+            return True
         except Exception as exc:
             logger.warning("Event POST 실패 (로컬에는 저장됨): %s", exc)
+            return False
