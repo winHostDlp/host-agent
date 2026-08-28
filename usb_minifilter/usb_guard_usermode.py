@@ -17,7 +17,6 @@ usb_guard_usermode.py — User-mode USB DLP (커널 드라이버 불필요)
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import threading
@@ -30,6 +29,7 @@ import win32con
 import win32file
 
 from core_comm.analysis_events import record_analysis_result
+from core_comm.drive_baseline import load_internal_drives
 from core_comm.payload_builder import AnalysisResult
 from core_comm.review_notifier import notify_review
 
@@ -44,51 +44,6 @@ _MIN_TEXT_LEN        = 20     # 추출 텍스트가 이 미만이면 검사 생�
 # DRIVE_REMOVABLE(2): USB 플래시드라이브 → 항상 감시
 # DRIVE_FIXED(3): 일부 USB는 Windows에서 Fixed로 보고됨 → 내장 기준 파일로 구분
 _MONITOR_TYPES = {win32con.DRIVE_REMOVABLE, win32con.DRIVE_FIXED}
-
-# 설치 시 생성되는 내장 드라이브 기준 파일
-_INTERNAL_DRIVES_CONFIG = Path(__file__).resolve().parent.parent / "config" / "internal_drives.json"
-
-
-def _load_internal_drives() -> set[str]:
-    """설치 시 저장된 내장 드라이브 목록을 반환.
-
-    파일이 없으면 현재 시점의 FIXED 드라이브를 내장으로 간주하고
-    파일을 새로 생성한다 (첫 실행 자동 초기화).
-    """
-    if _INTERNAL_DRIVES_CONFIG.exists():
-        try:
-            data = json.loads(_INTERNAL_DRIVES_CONFIG.read_text(encoding="utf-8"))
-            drives = set(data.get("internal_drives", []))
-            logger.info("[UsbGuard] 내장 드라이브 기준 로드: %s", drives)
-            return drives
-        except Exception as exc:
-            logger.warning("[UsbGuard] internal_drives.json 읽기 실패: %s", exc)
-
-    # 파일 없음 → 현재 연결된 모든 드라이브를 내장으로 간주하고 파일 생성
-    # (이동식 저장장치 제거 후 setup_agent.ps1 실행이 권장 절차이나, 미실행 시 안전하게 자동 초기화)
-    all_drives = {letter for letter, _ in _iter_drives()}
-    logger.warning(
-        "[UsbGuard] internal_drives.json 없음 — 현재 드라이브를 모두 내장으로 저장: %s\n"
-        "  권장: 이동식 저장장치 제거 후 install/setup_agent.ps1 실행",
-        all_drives,
-    )
-    try:
-        _INTERNAL_DRIVES_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-        _INTERNAL_DRIVES_CONFIG.write_text(
-            json.dumps(
-                {
-                    "internal_drives": sorted(all_drives),
-                    "_comment": "자동 생성(setup_agent.ps1 미실행). 이동식 저장장치 제거 후 재설치 권장.",
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-    except Exception as exc:
-        logger.warning("[UsbGuard] internal_drives.json 저장 실패: %s", exc)
-    return all_drives
-
 
 class UsbGuardUserMode:
     """
@@ -127,8 +82,9 @@ class UsbGuardUserMode:
         self._watched:    dict[str, threading.Event] = {}  # drive → stop event
         self._lock        = threading.Lock()
         self._poll_thread: Optional[threading.Thread] = None
-        # 설치 시 기록된 내장 드라이브 목록 — 에이전트 재시작과 무관하게 항상 동일한 기준 사용
-        self._internal_drives: set[str] = _load_internal_drives()
+        # 설치 시 기록된 이 PC의 내장 드라이브만 신뢰한다.
+        # 파일이 없거나 잘못되면 생성자가 예외를 던져 모니터를 시작하지 않는다.
+        self._internal_drives: set[str] = load_internal_drives()
 
     # ── 시작 / 정지 ──────────────────────────────────────────────────────────
 
@@ -152,7 +108,7 @@ class UsbGuardUserMode:
     # ── 드라이브 폴링 루프 ────────────────────────────────────────────────────
 
     def _drive_poll_loop(self) -> None:
-        # 기준: config/internal_drives.json 에 등록된 내장 드라이브 제외
+        # 기준: config/internal_drives.local.json 에 등록된 내장 드라이브 제외
         # REMOVABLE은 항상 감시, FIXED는 내장 기준 파일로 판단
         logger.info("[UsbGuard] 내장 드라이브 제외 기준: %s", self._internal_drives)
 
@@ -193,7 +149,7 @@ class UsbGuardUserMode:
     def _is_external(self, drive: str, dtype: int) -> bool:
         """외장 드라이브 여부 판단.
 
-        기준: internal_drives.json 에 없으면 외장.
+        기준: internal_drives.local.json 에 없으면 외장.
         FIXED/REMOVABLE 타입에 무관하게 설치 시 기록된 목록만 신뢰한다.
         네트워크(REMOTE), CD-ROM, RAM 디스크는 제외.
         """

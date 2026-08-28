@@ -1,6 +1,0 @@
-{
-  "internal_drives": [
-    "C:"
-  ],
-  "_comment": "setup 시 자동 생성. 이 목록은 내장 드라이브로 간주해 USB 감시에서 제외."
-}

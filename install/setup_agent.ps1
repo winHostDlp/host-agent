@@ -79,14 +79,15 @@ if ($pywin32Check -ne "ok") {
 Write-OK "pywin32 확인"
 
 # ── 내장 드라이브 기준 파일 생성 ──────────────────────────────────────────────
-# USB가 꽂히지 않은 상태에서 현재 FIXED 드라이브를 내장으로 저장.
+# USB가 꽂히지 않은 상태에서 현재 로컬 드라이브를 내장으로 저장.
 # 이 파일을 기준으로 이후 추가되는 드라이브를 이동식으로 판단한다.
 
-Write-Step "내장 드라이브 기준 파일 생성 (config/internal_drives.json)"
+Write-Step "이 PC의 내장 드라이브 기준 파일 생성 (config/internal_drives.local.json)"
 Write-Warn "  이동식 저장장치(USB, 외장 HDD 등)가 모두 제거된 상태인지 확인하세요."
-Write-Warn "  현재 연결된 모든 드라이브를 내장으로 기록합니다."
+Write-Warn "  Windows가 FIXED로 인식하는 외장 SSD도 반드시 제거하세요."
+Write-Warn "  현재 FIXED 드라이브만 내장 기준으로 기록합니다."
 $internalDrivesScript = @"
-import win32api, win32file, win32con, json, pathlib
+import win32api, win32file, win32con, json, os, pathlib
 def iter_drives():
     bitmask = win32api.GetLogicalDrives()
     for i in range(26):
@@ -97,17 +98,27 @@ def iter_drives():
                 yield letter, dtype
             except Exception:
                 pass
-# FIXED + REMOVABLE 모두 내장으로 기록 (설치 시점에 꽂혀 있는 건 전부 내장)
-internal = [l for l, t in iter_drives() if t in (win32con.DRIVE_FIXED, win32con.DRIVE_REMOVABLE)]
-out = pathlib.Path(r'$AgentDir\config\internal_drives.json')
-out.write_text(json.dumps({'internal_drives': internal, '_comment': 'setup 시 자동 생성. 이동식 저장장치 제거 후 설치 권장. 이 목록 외 드라이브는 외장으로 간주.'}, ensure_ascii=False, indent=2), encoding='utf-8')
-print('OK internal_drives=' + str(internal))
+drives = list(iter_drives())
+removable = [l for l, t in drives if t == win32con.DRIVE_REMOVABLE]
+if removable:
+    raise RuntimeError('이동식 드라이브를 모두 제거한 뒤 다시 실행하세요: ' + str(removable))
+# ponytail: GetDriveType은 FIXED로 보고되는 외장 디스크를 구분하지 못한다.
+# 자동 교정이 필요하면 Win32_DiskDrive BusType 매핑으로 교체한다.
+internal = [l for l, t in drives if t == win32con.DRIVE_FIXED]
+out = pathlib.Path(r'$AgentDir\config\internal_drives.local.json')
+system_drive = os.environ.get('SystemDrive', '').upper()
+if not internal or not system_drive or system_drive not in internal:
+    raise RuntimeError('시스템 드라이브를 포함한 안전한 내장 드라이브 기준을 만들지 못했습니다.')
+tmp = out.with_suffix(out.suffix + '.tmp')
+tmp.write_text(json.dumps({'internal_drives': internal, '_comment': '이 PC의 로컬 기준. Git에 올리지 마세요. 이동식 저장장치를 모두 제거한 상태에서 생성했습니다.'}, ensure_ascii=False, indent=2), encoding='utf-8')
+tmp.replace(out)
+print('OK internal_drives.local=' + str(internal))
 "@
 $result = & $PythonExe -c $internalDrivesScript 2>&1
 if ($result -match "^OK") {
     Write-OK "내장 드라이브 기준 저장: $result"
 } else {
-    Write-Warn "내장 드라이브 기준 생성 실패 (에이전트 첫 실행 시 자동 생성됩니다): $result"
+    Write-Err "내장 드라이브 기준 생성 실패. 안전을 위해 FileGuard를 설치하지 않습니다: $result"
 }
 
 # ════════════════════════════════════════════════════════════════════════════════

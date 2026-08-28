@@ -30,3 +30,4 @@ htmlcov/
 # Local overrides
 .env
 *.local.yaml
+config/internal_drives.local.json*
