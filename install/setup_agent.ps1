@@ -1,14 +1,12 @@
-﻿#Requires -RunAsAdministrator
-<#
+﻿<#
 .SYNOPSIS
-    Sentry DLP 에이전트를 Windows 서비스 + Task Scheduler 작업으로 등록합니다.
+    Sentry DLP 사용자 에이전트를 현재 계정의 Task Scheduler 작업으로 등록합니다.
 
 .DESCRIPTION
-    1. SentryDLPService  — 선택 설치 Windows 서비스 (자동 시작, 크래시 재시작)
-       Session 0에서 실행: SMTP 프록시, HTTP 모니터
-    2. SentryUserAgent   — Task Scheduler 작업 (로그온 트리거, 현재 사용자 제한 권한)
-       사용자 세션에서 실행: 클립보드 훅, Outlook 훅, FileGuard,
-       HTTPS 웹 프록시, 알림 팝업
+    SentryUserAgent — Task Scheduler 작업 (로그온 트리거, 현재 사용자 제한 권한)
+    사용자 세션에서 클립보드 훅, Outlook 훅, FileGuard, HTTPS 웹 프록시,
+    알림 팝업을 실행합니다. LocalSystem 서비스와 다중 사용자 그룹 작업은
+    이 설치기에서 지원하지 않습니다.
 
 .PARAMETER PythonExe
     Python 실행 파일 경로. 기본값은 스크립트 실행 시 자동 탐지.
@@ -16,32 +14,19 @@
 .PARAMETER AgentDir
     에이전트 루트 디렉토리. 기본값: 스크립트의 상위 디렉토리.
 
-.PARAMETER ForCurrentUserOnly
-    $true 시 Task Scheduler 작업을 현재 사용자에게만 등록.
-    $false 시 모든 사용자에게 적용 (NT AUTHORITY\Users 그룹).
-    발표용 기본값은 사용자별 Outlook·HKCU 프록시·CA와 일치하도록 $true.
-
-.PARAMETER InstallSystemService
-    SMTP/HTTP 시스템 채널용 LocalSystem 서비스를 추가 설치합니다. 기본은 미설치.
-    관리자만 수정할 수 있는 보호 경로의 AgentDir/Python에서만 사용하세요.
-
 .EXAMPLE
     .\setup_agent.ps1
     .\setup_agent.ps1 -PythonExe "C:\Python313\python.exe"
-    .\setup_agent.ps1 -InstallSystemService
 #>
 
 param(
-    [string]$PythonExe         = "",
-    [string]$AgentDir          = "",
-    [bool]  $ForCurrentUserOnly = $true,
-    [switch]$InstallSystemService
+    [string]$PythonExe = "",
+    [string]$AgentDir  = ""
 )
 
 $ErrorActionPreference = "Stop"
 
-$ServiceName  = "SentryDLPService"
-$TaskName     = "SentryUserAgent"
+$TaskName = "SentryUserAgent"
 
 function Write-Step([string]$msg) { Write-Host "[*] $msg" -ForegroundColor Cyan }
 function Write-OK  ([string]$msg) { Write-Host "[+] $msg" -ForegroundColor Green }
@@ -71,11 +56,10 @@ if (-not (Test-Path $PythonWExe)) {
 }
 $PythonWExe = (Resolve-Path $PythonWExe).Path
 
-$ServiceScript = Join-Path $AgentDir "sentry_service.py"
-$UserScript    = Join-Path $AgentDir "sentry_user_agent.py"
+$UserScript = Join-Path $AgentDir "sentry_user_agent.py"
 
-foreach ($f in @($ServiceScript, $UserScript)) {
-    if (-not (Test-Path $f)) { Write-Err "파일 없음: $f" }
+if (-not (Test-Path $UserScript)) {
+    Write-Err "파일 없음: $UserScript"
 }
 
 Write-Step "AgentDir  : $AgentDir"
@@ -87,7 +71,7 @@ Write-Step "PythonWExe: $PythonWExe"
 # 프로젝트 전용 venv에 requirements.txt를 설치한 뒤 다시 실행해야 한다.
 
 Write-Step "Host Agent 런타임 의존성 확인"
-$moduleNames = "requests,yaml,win32api,win32clipboard,win32con,win32file,win32gui,win32process,win32serviceutil,pythoncom,win32com,docx,fitz,openpyxl,pptx,striprtf,olefile,mitmproxy,aiosmtpd,aiosmtplib"
+$moduleNames = "requests,yaml,win32api,win32clipboard,win32con,win32file,win32gui,win32process,pythoncom,win32com,docx,fitz,openpyxl,pptx,striprtf,olefile,mitmproxy"
 $dependencyCheckScript = @"
 import importlib
 import sys
@@ -156,76 +140,7 @@ if ($result -match "^OK") {
 }
 
 # ════════════════════════════════════════════════════════════════════════════════
-# 1. Windows 서비스 등록 (SentryDLPService)
-# ════════════════════════════════════════════════════════════════════════════════
-
-if ($InstallSystemService) {
-    $programFilesRoot = (Resolve-Path $env:ProgramFiles).Path.TrimEnd('\') + '\'
-    if (-not $AgentDir.StartsWith($programFilesRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
-        Write-Err "LocalSystem 서비스는 관리자 보호 경로에서만 설치할 수 있습니다. AgentDir을 $programFilesRoot 아래로 복사하고 ACL을 확인하세요."
-    }
-    if (-not $PythonExe.StartsWith($programFilesRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
-        Write-Err "LocalSystem 서비스용 Python도 관리자 보호 경로에 있어야 합니다: $programFilesRoot"
-    }
-
-    Write-Step "Windows 서비스 등록: $ServiceName"
-
-    # 기존 서비스 제거 후 marked-for-deletion 상태가 끝날 때까지 제한 시간 대기
-    $existing = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    if ($existing) {
-        sc.exe stop $ServiceName 2>$null | Out-Null
-        $existing = $null
-        sc.exe delete $ServiceName 2>$null | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            Write-Err "기존 서비스 삭제 요청 실패: sc.exe exit $LASTEXITCODE"
-        }
-        $deleteDeadline = [DateTime]::UtcNow.AddSeconds(20)
-        do {
-            Start-Sleep -Milliseconds 500
-            $remainingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-        } while ($remainingService -and [DateTime]::UtcNow -lt $deleteDeadline)
-        if ($remainingService) {
-            Write-Err "기존 서비스가 20초 안에 삭제되지 않았습니다. 관련 서비스 관리 창을 닫고 다시 실행하세요."
-        }
-        Write-Warn "기존 서비스 제거 완료"
-    }
-
-    # 서비스 설치 (pywin32 방식)
-    & $PythonExe $ServiceScript --startup=auto install 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        Write-Err "서비스 설치 실패. 로그를 확인하세요."
-    }
-
-# ── 크래시 복구 설정 (첫 번째·두 번째 실패 → 1분 후 재시작, 이후 → 5분) ────
-
-    sc.exe failure $ServiceName reset= 86400 `
-        actions= restart/60000/restart/60000/restart/300000 | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Err "서비스 크래시 재시작 정책 설정 실패: sc.exe exit $LASTEXITCODE"
-    }
-    Write-OK "크래시 재시작 정책 설정 완료"
-
-# ── 서비스 시작 ────────────────────────────────────────────────────────────────
-
-Write-Step "서비스 시작"
-    sc.exe start $ServiceName | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Err "서비스 시작 요청 실패: sc.exe exit $LASTEXITCODE"
-    }
-    Start-Sleep -Seconds 2
-    $svc = Get-Service -Name $ServiceName
-    if ($svc.Status -eq "Running") {
-        Write-OK "서비스 실행 중 ✓"
-    } else {
-        Write-Err "서비스 상태: $($svc.Status) — 로그를 확인하세요: $AgentDir\logs\service.log"
-    }
-} else {
-    Write-Warn "발표용 기본 설정: SMTP/HTTP LocalSystem 서비스 설치를 건너뜁니다."
-    Write-Warn "필요하면 보호된 Program Files 배포본에서 -InstallSystemService를 명시하세요."
-}
-
-# ════════════════════════════════════════════════════════════════════════════════
-# 2. Task Scheduler 작업 등록 (SentryUserAgent)
+# Task Scheduler 작업 등록 (SentryUserAgent)
 # ════════════════════════════════════════════════════════════════════════════════
 
 Write-Step "Task Scheduler 작업 등록: $TaskName"
@@ -243,22 +158,17 @@ $action = New-ScheduledTaskAction `
 # 로그온 트리거
 $trigger = New-ScheduledTaskTrigger -AtLogOn
 
-if ($ForCurrentUserOnly) {
-    $principal = New-ScheduledTaskPrincipal `
-        -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) `
-        -LogonType Interactive `
-        -RunLevel Limited
-} else {
-    $principal = New-ScheduledTaskPrincipal `
-        -GroupId "BUILTIN\Users" `
-        -RunLevel Limited
-}
+$principal = New-ScheduledTaskPrincipal `
+    -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) `
+    -LogonType Interactive `
+    -RunLevel Limited
 
 $settings = New-ScheduledTaskSettingsSet `
     -Hidden `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
-    -ExecutionTimeLimit (New-TimeSpan -Days 365) `
+    -ExecutionTimeLimit ([TimeSpan]::Zero) `
+    -MultipleInstances IgnoreNew `
     -RestartCount 3 `
     -RestartInterval (New-TimeSpan -Minutes 1) `
     -StartWhenAvailable
@@ -291,18 +201,11 @@ if ($task.State -eq "Running") {
 Write-Host ""
 Write-Host "══════════════════════════════════════════" -ForegroundColor Cyan
 Write-OK "설치 완료"
-if ($InstallSystemService) {
-    Write-Host "  서비스 : $ServiceName (자동 시작, 크래시 재시작)"
-} else {
-    Write-Host "  서비스 : 미설치 (SMTP/HTTP 시스템 채널 제외)"
-}
+Write-Host "  서비스 : 미설치 (R009 발표 범위 밖의 SMTP/HTTP 시스템 채널 제외)"
 Write-Host "  작업   : $TaskName (로그온 트리거)"
 Write-Host "  로그   : $AgentDir\logs\"
 Write-Host ""
 Write-Host "설정 변경 후 사용하는 실행 계층을 재시작하세요:"
-if ($InstallSystemService) {
-    Write-Host "  시스템 채널(SMTP/HTTP): sc.exe stop $ServiceName; sc.exe start $ServiceName"
-}
 Write-Host "  사용자 채널(Clipboard/Outlook/FileGuard/WebProxy):"
 Write-Host "    Stop-ScheduledTask -TaskName $TaskName"
 Write-Host "    Start-ScheduledTask -TaskName $TaskName"

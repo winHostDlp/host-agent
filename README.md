@@ -26,9 +26,17 @@ python -m venv .venv
 
 `setup_agent.ps1`은 Windows PowerShell 5.1에서 실행할 수 있으며, 선택한 Python의 필수 런타임·파일 추출 모듈을 먼저 검증합니다. 모듈이 없거나 깨졌으면 시스템 Python에 자동 설치하지 않고 위와 같이 프로젝트 전용 venv에 `requirements.txt`를 설치하도록 안내한 뒤 안전하게 중단합니다.
 
-발표용 기본 설치는 현재 사용자 전용 `SentryUserAgent`만 제한 권한·`pythonw.exe`로 등록하며, 배터리에서도 시작·유지합니다. SMTP·HTTP용 LocalSystem 서비스는 기본 설치하지 않습니다. 시스템 채널이 꼭 필요할 때만 관리자 전용 `Program Files` 배포본과 Python을 준비한 뒤 `-InstallSystemService`를 명시하세요. 사용자 쓰기 가능한 Desktop checkout을 LocalSystem으로 실행하지 않습니다.
+발표용 기본 설치는 관리자 권한을 요구하지 않고 현재 사용자 전용
+`SentryUserAgent`만 제한 권한·`pythonw.exe`로 등록합니다. 배터리에서도
+무기한 시작·유지하고 중복 실행은 거부합니다. 고정 작업 이름과 사용자별
+HKCU·Outlook·클립보드에 의존하므로 한 대의 시연 PC에서는 지정한 Windows
+계정 하나만 지원합니다. 다른 계정이 동시에 설치·실행한 것으로 완료 처리하지
+마세요. SMTP·HTTP용 LocalSystem 서비스는 R009 발표 범위와 이 설치기에서
+제외했습니다. `sentry_service.py`는 기존 실험 코드일 뿐 발표 설치 절차가
+아니며, 별도 보호 배포·쓰기 상태 분리·Windows 서비스 검증 없이 관리자
+서비스로 등록하지 마세요.
 
-USB FileGuard는 잘못된 드라이브 기준이 내장 파일을 삭제하는 일을 막기 위해 자동 초기화하지 않습니다. 첫 실행 전에 이동식 저장장치를 모두 제거하고 관리자 PowerShell에서 다음을 실행하세요.
+USB FileGuard는 잘못된 드라이브 기준이 내장 파일을 삭제하는 일을 막기 위해 자동 초기화하지 않습니다. 첫 실행 전에 이동식 저장장치를 모두 제거하고 일반 Windows PowerShell에서 다음을 실행하세요.
 
 ```powershell
 .\install\setup_agent.ps1 -PythonExe .\.venv\Scripts\python.exe
@@ -38,12 +46,15 @@ USB FileGuard는 잘못된 드라이브 기준이 내장 파일을 삭제하는 
 
 Windows가 `FIXED`로 인식하는 외장 SSD는 내장 드라이브와 자동 구분할 수 없으므로 기준 생성 전에 USB·외장 저장장치를 모두 제거해야 합니다. 기준 생성 뒤 내장 드라이브를 추가·제거하거나 드라이브 문자를 바꿨다면 FileGuard를 다시 사용하기 전에 외장 저장장치를 제거하고 `setup_agent.ps1`을 재실행해 기준을 갱신하세요.
 
-실행 계층은 다음과 같이 분리됩니다.
+발표 설치의 실행 계층은 하나입니다.
 
-- 선택 설치 Windows 서비스 `SentryDLPService`: SMTP·HTTP 시스템 채널
-- 예약 작업 `SentryUserAgent`: Clipboard·Outlook·FileGuard·WebProxy 사용자 채널
+- 현재 계정 예약 작업 `SentryUserAgent`: Clipboard·Outlook·FileGuard·WebProxy
+  사용자 채널
+- SMTP·HTTP 시스템 채널: R009 발표 설치 범위에서 제외
 
-`settings.yaml`이나 `channel_policy.json`을 바꾼 뒤에는 해당 실행 계층을 다시 시작해야 합니다. 다섯 발표 시나리오는 사용자 채널이므로 다음 명령으로 예약 작업을 재시작하고 `logs\user_agent.log`에서 채널 시작 상태를 확인합니다.
+`settings.yaml`이나 `channel_policy.json`을 바꾼 뒤에는 예약 작업을 다시
+시작해야 합니다. 다섯 발표 시나리오는 모두 사용자 채널이므로 다음 명령으로
+재시작하고 `logs\user_agent.log`에서 채널 시작 상태를 확인합니다.
 
 ```powershell
 Stop-ScheduledTask -TaskName SentryUserAgent

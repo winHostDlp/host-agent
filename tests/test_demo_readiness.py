@@ -57,14 +57,19 @@ def test_setup_agent_is_ps51_safe_and_starts_registered_user_task():
     assert "Start-ScheduledTask -TaskName $TaskName" in setup
     assert "Start-Process -FilePath $PythonExe" not in setup
     assert "Stop-ScheduledTask -TaskName $TaskName" in setup
-    assert "[bool]  $ForCurrentUserOnly = $true" in setup
-    assert "[switch]$InstallSystemService" in setup
     assert "-Execute $PythonWExe" in setup
     assert "-RunLevel Limited" in setup
     assert "-RunLevel Highest" not in setup
     assert "-AllowStartIfOnBatteries" in setup
     assert "-DontStopIfGoingOnBatteries" in setup
-    assert "marked-for-deletion" in setup
+    assert "#Requires -RunAsAdministrator" not in setup
+    assert "InstallSystemService" not in setup
+    assert "SentryDLPService" not in setup
+    assert "sc.exe" not in setup
+    assert "GroupId" not in setup
+    assert "win32serviceutil" not in setup
+    assert "-ExecutionTimeLimit ([TimeSpan]::Zero)" in setup
+    assert "-MultipleInstances IgnoreNew" in setup
     assert '$ErrorActionPreference = "Stop"' in setup
 
 
