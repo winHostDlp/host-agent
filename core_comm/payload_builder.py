@@ -10,7 +10,7 @@ AI 서버 요청 포맷 (AgentRequest)
 ---------------------------------
 {
   "event_id":         "<uuid>",
-  "channel":          "clipboard|outlook|smtp|web_mail|file_guard|http",
+  "channel":          "clipboard|outlook|smtp|web_mail|drive_upload|file_guard|http",
   "user_id":          "<Windows USERNAME>",
   "matched_patterns": ["rrn", "credit_card"],   // 패턴 ID 목록 (문자열)
   "snippet":          "검사 대상 텍스트 스니펫",
@@ -26,13 +26,14 @@ AI 서버 응답 포맷 (AgentResponse)
   "event_id":         "<uuid>",
   "decision":         "allow|review|block",
   "confidence_score": 0.87,     // 0.0–1.0
-  "model_version":    "koelectra-dlp-v6",
+  "model_version":    "koelectra-dlp-v7",
   "latency_ms":       23.4,
   "reason":           "주민등록번호 탐지됨"
 }
 """
 
 import hashlib
+import math
 import os
 import re
 import socket
@@ -102,6 +103,7 @@ class AnalysisResult:
     reason: str = ""
     model_version: str = ""
     latency_ms: float = 0.0
+    analysis_failed: bool = False  # AI 장애로 Fail-Open 결과가 생성됐는지 여부
 
     @property
     def risk_score(self) -> float:
@@ -255,19 +257,53 @@ class ResponseParser:
 
     @staticmethod
     def parse(raw: dict[str, Any], request_id: str = "") -> AnalysisResult:
-        # AgentResponse: decision + confidence_score (0-1)
-        action = raw.get("decision", "block").lower()
-        if action not in {"allow", "block", "review"}:
-            action = "block"
+        if not isinstance(raw, dict):
+            raise ValueError("AI 응답은 JSON 객체여야 합니다.")
 
-        confidence = float(raw.get("confidence_score", 1.0))
-        confidence = max(0.0, min(1.0, confidence))
+        # AgentResponse의 필수 계약은 누락·보정하지 않는다. 잘못된 응답은
+        # ApiClient 예외 경로에서 명시적인 Fail-Open 결과로 변환한다.
+        raw_event_id = raw.get("event_id")
+        if not isinstance(raw_event_id, str) or not raw_event_id.strip():
+            raise ValueError("AI 응답 event_id가 누락되었거나 문자열이 아닙니다.")
+        if request_id and raw_event_id != request_id:
+            raise ValueError(
+                f"AI 응답 event_id가 요청과 다릅니다: {raw_event_id!r} != {request_id!r}"
+            )
+
+        raw_action = raw.get("decision")
+        if not isinstance(raw_action, str) or not raw_action.strip():
+            raise ValueError("AI 응답 decision이 누락되었거나 문자열이 아닙니다.")
+        action = raw_action.strip().lower()
+        if action not in {"allow", "block", "review"}:
+            raise ValueError(f"알 수 없는 AI decision: {raw_action!r}")
+
+        raw_confidence = raw.get("confidence_score")
+        if isinstance(raw_confidence, bool) or not isinstance(raw_confidence, (int, float)):
+            raise ValueError("AI 응답 confidence_score가 누락되었거나 숫자가 아닙니다.")
+        confidence = float(raw_confidence)
+        if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+            raise ValueError("AI 응답 confidence_score는 0.0~1.0의 유한한 숫자여야 합니다.")
+
+        raw_model_version = raw.get("model_version")
+        if not isinstance(raw_model_version, str) or not raw_model_version.strip():
+            raise ValueError("AI 응답 model_version이 누락되었거나 문자열이 아닙니다.")
+
+        raw_latency = raw.get("latency_ms")
+        if isinstance(raw_latency, bool) or not isinstance(raw_latency, (int, float)):
+            raise ValueError("AI 응답 latency_ms가 누락되었거나 숫자가 아닙니다.")
+        latency = float(raw_latency)
+        if not math.isfinite(latency) or latency < 0.0:
+            raise ValueError("AI 응답 latency_ms는 0 이상의 유한한 숫자여야 합니다.")
+
+        raw_reason = raw.get("reason")
+        if raw_reason is not None and not isinstance(raw_reason, str):
+            raise ValueError("AI 응답 reason은 문자열 또는 null이어야 합니다.")
 
         return AnalysisResult(
-            request_id=raw.get("event_id", request_id),
+            request_id=raw_event_id,
             confidence_score=confidence,
             action=action,
-            reason=raw.get("reason", ""),
-            model_version=raw.get("model_version", ""),
-            latency_ms=float(raw.get("latency_ms", 0)),
+            reason=raw_reason or "",
+            model_version=raw_model_version,
+            latency_ms=latency,
         )

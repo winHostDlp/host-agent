@@ -5,8 +5,8 @@
 1. localhost:2525 에서 SMTP 서버 대기 (aiosmtpd)
 2. 메일 클라이언트(Outlook, Thunderbird 등)의 SMTP를 localhost:2525 로 설정
 3. 수신한 메일에서 본문 + 첨부파일 텍스트 추출 → 정규식 검사
-4. 미탐지 → 실제 SMTP 서버로 릴레이
-   탐지   → 릴레이 거부(SMTP 550) + 알림
+4. 미탐지 또는 AI review/allow → 실제 SMTP 서버로 릴레이
+   AI block                      → 릴레이 거부(SMTP 550) + 알림
 
 설정 방법
 ---------
@@ -42,7 +42,7 @@ class _DLPHandler:
         relay_username: Optional[str],
         relay_password: Optional[str],
         inspect: Callable[[str], list[dict[str, Any]]],
-        on_blocked: Callable[[str, list[dict[str, Any]], str], None],
+        on_blocked: Callable[[str, list[dict[str, Any]], str], str],
         fi_extract: Callable[[bytes, str], Optional[str]],
     ) -> None:
         self._internal_domains = internal_domains
@@ -88,9 +88,18 @@ class _DLPHandler:
             await self._relay(envelope)
             return "250 OK"
 
-        # 차단
         summary = f"수신자: {', '.join(external)}"
-        self._on_blocked(summary, hits, "smtp_proxy")
+        decision = self._on_blocked(summary, hits, "smtp_proxy") or "block"
+        if decision != "block":
+            await self._relay(envelope)
+            logger.warning(
+                "SMTP %s 경고 기록 — 메일 전송 허용 from=%s to=%s",
+                decision,
+                envelope.mail_from,
+                external,
+            )
+            return "250 OK (DLP 경고 기록 — 전송 허용)"
+
         logger.warning(
             "SMTP 차단 — from=%s to=%s hits=%s",
             envelope.mail_from,
@@ -164,7 +173,7 @@ class SmtpProxy:
         relay_password: Optional[str],
         internal_domains: list[str],
         inspect: Callable[[str], list[dict[str, Any]]],
-        on_blocked: Callable[[str, list[dict[str, Any]], str], None],
+        on_blocked: Callable[[str, list[dict[str, Any]], str], str],
         fi_extract: Callable[[bytes, str], Optional[str]],
     ) -> None:
         self._listen_port = listen_port

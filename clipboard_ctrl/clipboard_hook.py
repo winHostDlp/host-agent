@@ -71,6 +71,8 @@ _user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
 _user32.GetAsyncKeyState.restype = ctypes.wintypes.SHORT
 _user32.GetForegroundWindow.argtypes = []
 _user32.GetForegroundWindow.restype = ctypes.wintypes.HWND
+_user32.GetClipboardSequenceNumber.argtypes = []
+_user32.GetClipboardSequenceNumber.restype = ctypes.wintypes.DWORD
 _user32.PostThreadMessageW.argtypes = [
     ctypes.wintypes.DWORD,
     ctypes.wintypes.UINT,
@@ -101,7 +103,7 @@ class ClipboardHook:
     def __init__(
         self,
         should_inspect: Callable[[str], bool],
-        on_text_pasted: Callable[[str, str], bool],
+        on_text_pasted: Callable[[str, str, int], bool],
         file_inspector: Optional[Any] = None,
     ) -> None:
         """
@@ -112,7 +114,7 @@ class ClipboardHook:
             Return True  → inspect clipboard content before allowing paste.
             Return False → allow paste without inspection.
         on_text_pasted:
-            Receives (normalized_text, process_name).
+            Receives (normalized_text, process_name, clipboard_sequence).
             Return True  → block the paste.
             Return False → allow the paste.
         file_inspector:
@@ -128,8 +130,9 @@ class ClipboardHook:
         self._hook_id: Optional[int] = None
         self._hook_proc_ref: Optional[LowLevelKeyboardProc] = None  # prevent GC
 
-        # AI allow 판정 시 클립보드 복원 후 재붙여넣기할 때 훅이 스스로를 무시하는 플래그
+        # AI allow 판정 후 재붙여넣기할 때 훅이 스스로를 무시하는 플래그
         self._skip_next_paste: bool = False
+        self._release_lock = threading.Lock()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -199,56 +202,84 @@ class ClipboardHook:
             logger.debug("CF_HDROP 처리 실패: %s", exc)
             return None
 
-    def release_paste(self, original_text: str) -> None:
-        """AI가 허용 판정을 내렸을 때 클립보드를 복원하고 Ctrl+V를 재발행한다.
+    def release_paste(self, expected_sequence: Optional[int] = None) -> bool:
+        """Keep the original clipboard formats and re-issue Ctrl+V.
 
-        백그라운드 스레드에서 호출되어야 한다.
-        CF_HDROP(파일) 붙여넣기는 텍스트로 대체 복원한다.
+        Returns ``True`` only when all four keyboard events were injected.
+        If the clipboard changed while AI analysis was pending, no input is
+        injected because it would no longer be the user's original paste.
         """
         import time
+
         time.sleep(0.08)  # 훅 처리 안정화 대기
 
-        # 클립보드에 원문 복원
-        try:
-            win32clipboard.OpenClipboard()
-            win32clipboard.EmptyClipboard()
-            win32clipboard.SetClipboardText(original_text, win32con.CF_UNICODETEXT)
-            win32clipboard.CloseClipboard()
-        except Exception as exc:
-            logger.warning("클립보드 복원 실패 — 붙여넣기 재발행 취소: %s", exc)
-            return
+        with self._release_lock:
+            current_sequence = int(_user32.GetClipboardSequenceNumber())
+            if (
+                expected_sequence
+                and current_sequence
+                and current_sequence != expected_sequence
+            ):
+                logger.warning(
+                    "클립보드가 AI 분석 중 변경됨 — 재붙여넣기 취소 "
+                    "(expected=%d current=%d)",
+                    expected_sequence,
+                    current_sequence,
+                )
+                return False
 
-        # 다음 Ctrl+V는 훅에서 무시 (무한 루프 방지)
-        self._skip_next_paste = True
+            # 클립보드를 비우거나 텍스트로 변환하지 않는다. 이로써
+            # CF_HDROP, HTML, RTF 등 원본의 모든 클립보드 형식이 유지된다.
+            self._skip_next_paste = True
+            KEYEVENTF_KEYUP = 0x0002
 
-        # SendInput으로 Ctrl+V 시뮬레이션
-        KEYEVENTF_KEYUP = 0x0002
+            class _KEYBDINPUT(ctypes.Structure):
+                _fields_ = [
+                    ("wVk",         ctypes.c_ushort),
+                    ("wScan",       ctypes.c_ushort),
+                    ("dwFlags",     ctypes.c_ulong),
+                    ("time",        ctypes.c_ulong),
+                    ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+                ]
 
-        class _KEYBDINPUT(ctypes.Structure):
-            _fields_ = [
-                ("wVk",         ctypes.c_ushort),
-                ("wScan",       ctypes.c_ushort),
-                ("dwFlags",     ctypes.c_ulong),
-                ("time",        ctypes.c_ulong),
-                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
-            ]
+            class _INPUT(ctypes.Structure):
+                _fields_ = [
+                    ("type", ctypes.c_ulong),
+                    ("ki",   _KEYBDINPUT),
+                    ("_pad", ctypes.c_ubyte * 8),
+                ]
 
-        class _INPUT(ctypes.Structure):
-            _fields_ = [
-                ("type", ctypes.c_ulong),
-                ("ki",   _KEYBDINPUT),
-                ("_pad", ctypes.c_ubyte * 8),
-            ]
+            seq = (
+                _INPUT(type=1, ki=_KEYBDINPUT(wVk=VK_CONTROL)),
+                _INPUT(type=1, ki=_KEYBDINPUT(wVk=VK_V)),
+                _INPUT(type=1, ki=_KEYBDINPUT(wVk=VK_V,       dwFlags=KEYEVENTF_KEYUP)),
+                _INPUT(type=1, ki=_KEYBDINPUT(wVk=VK_CONTROL, dwFlags=KEYEVENTF_KEYUP)),
+            )
+            arr = (_INPUT * len(seq))(*seq)
 
-        seq = (
-            _INPUT(type=1, ki=_KEYBDINPUT(wVk=VK_CONTROL)),
-            _INPUT(type=1, ki=_KEYBDINPUT(wVk=VK_V)),
-            _INPUT(type=1, ki=_KEYBDINPUT(wVk=VK_V,       dwFlags=KEYEVENTF_KEYUP)),
-            _INPUT(type=1, ki=_KEYBDINPUT(wVk=VK_CONTROL, dwFlags=KEYEVENTF_KEYUP)),
-        )
-        arr = (_INPUT * len(seq))(*seq)
-        ctypes.windll.user32.SendInput(len(seq), arr, ctypes.sizeof(_INPUT))
-        logger.info("AI allow — 붙여넣기 복원 재발행 완료")
+            try:
+                sent = int(
+                    ctypes.windll.user32.SendInput(
+                        len(seq), arr, ctypes.sizeof(_INPUT)
+                    )
+                )
+            except Exception:
+                self._skip_next_paste = False
+                logger.exception("SendInput 예외 — 붙여넣기 재발행 실패")
+                return False
+
+            if sent != len(seq):
+                self._skip_next_paste = False
+                logger.error(
+                    "SendInput 실패 — %d/%d 입력만 삽입됨 (error=%d)",
+                    sent,
+                    len(seq),
+                    ctypes.get_last_error(),
+                )
+                return False
+
+            logger.info("AI allow — 기존 클립보드 유지 후 붙여넣기 재발행 완료")
+            return True
 
     def _handle_paste(self) -> bool:
         """Return True to block the paste, False to allow it."""
@@ -264,6 +295,8 @@ class ClipboardHook:
         if not self._should_inspect(process_name):
             return False
 
+        clipboard_sequence = int(_user32.GetClipboardSequenceNumber())
+
         # 1) 텍스트/HTML 클립보드
         text = TextExtractor.extract()
         normalized = TextExtractor.normalize(text) if text else ""
@@ -276,7 +309,23 @@ class ClipboardHook:
         if not normalized:
             return False
 
-        return self._on_text_pasted(normalized, process_name)
+        current_sequence = int(_user32.GetClipboardSequenceNumber())
+        if (
+            clipboard_sequence
+            and current_sequence
+            and current_sequence != clipboard_sequence
+        ):
+            logger.warning(
+                "클립보드 검사 중 내용이 변경됨 — 비동기 검사 생략 "
+                "(before=%d after=%d)",
+                clipboard_sequence,
+                current_sequence,
+            )
+            return False
+        if not clipboard_sequence:
+            clipboard_sequence = current_sequence
+
+        return self._on_text_pasted(normalized, process_name, clipboard_sequence)
 
     def _keyboard_hook_proc(
         self, n_code: int, w_param: int, l_param: int

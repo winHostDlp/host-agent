@@ -6,13 +6,12 @@
 2. 전송 직전(ItemSend) 이벤트 수신
 3. 수신자 도메인 확인 → 외부 수신자가 있을 때만 검사
 4. 메일 본문 + 첨부파일 텍스트 추출 → 정규식 검사
-5. 민감정보 발견 시 메일을 임시보관함(Drafts)으로 이동하여 전송 차단 + 알림
+5. AI block이면 ItemSend Cancel=True로 전송 취소, review/allow이면 전송 허용
 
 제한
 ----
 - Outlook이 실행 중이어야 한다 (이 훅이 먼저 켜져 있어도 Outlook 재시작 시 재연결 필요).
-- 파이썬 COM 이벤트에서 Cancel ByRef 파라미터를 직접 변경하기 어렵기 때문에
-  '임시보관함 이동' 방식으로 차단한다.
+- pywin32는 이벤트 핸들러 반환값을 유일한 ByRef Cancel 파라미터로 전달한다.
 - Outlook 버전: 2016 이상 (Microsoft 365 포함).
 """
 
@@ -25,15 +24,10 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-# Outlook 폴더 상수
-_OL_FOLDER_DRAFTS   = 16
-_OL_FOLDER_OUTBOX   = 4
-_OL_DISCARD         = 0   # MailItem.Close() 옵션
-
 
 def _build_sink(
     internal_domains: frozenset[str],
-    on_blocked: Callable[[str, list[dict[str, Any]], str], None],
+    on_blocked: Callable[[str, list[dict[str, Any]], str], Optional[str]],
     inspect: Callable[[str], list[dict[str, Any]]],
     file_inspector_extract: Callable[[bytes, str], Optional[str]],
 ) -> type:
@@ -42,7 +36,7 @@ def _build_sink(
     class _OutlookSink:
         def OnItemSend(self, item, cancel):  # noqa: N802
             try:
-                _handle_item_send(
+                return _handle_item_send(
                     item,
                     internal_domains,
                     on_blocked,
@@ -51,6 +45,7 @@ def _build_sink(
                 )
             except Exception:
                 logger.exception("OutlookSink.OnItemSend 처리 중 예외")
+                return False
 
     return _OutlookSink
 
@@ -105,17 +100,17 @@ def _collect_text(
 def _handle_item_send(
     item: Any,
     internal_domains: frozenset[str],
-    on_blocked: Callable[[str, list[dict[str, Any]], str], None],
+    on_blocked: Callable[[str, list[dict[str, Any]], str], Optional[str]],
     inspect: Callable[[str], list[dict[str, Any]]],
     file_inspector_extract: Callable[[bytes, str], Optional[str]],
-) -> None:
+) -> bool:
     # 메일 아이템인지 확인 (약속/작업 등 제외)
     try:
         item_class = item.Class  # 43 = olMail
         if item_class != 43:
-            return
+            return False
     except Exception:
-        return
+        return False
 
     # 수신자 중 외부 도메인이 있는지 확인
     external_recipients: list[str] = []
@@ -139,33 +134,42 @@ def _handle_item_send(
 
     if not external_recipients:
         logger.debug("OutlookHook: 외부 수신자 없음 — 검사 생략")
-        return
+        return False
 
     logger.debug("OutlookHook: 외부 수신자 %s — 내용 검사 시작", external_recipients)
 
     text = _collect_text(item, file_inspector_extract)
     if not text.strip():
-        return
+        return False
 
     hits = inspect(text)
     if not hits:
         logger.debug("OutlookHook: 정규식 미탐지 — 전송 허용")
-        return
+        return False
 
-    # 차단: 임시보관함으로 이동
     summary = f"수신자: {', '.join(external_recipients)}"
-    try:
-        drafts = item.Application.Session.GetDefaultFolder(_OL_FOLDER_DRAFTS)
-        item.Move(drafts)
+    decision = on_blocked(summary, hits, "outlook.exe")
+    if decision != "block":
         logger.warning(
-            "OutlookHook: 메일 차단 — hits=%s recipients=%s",
-            [h.get("id") for h in hits],
+            "OutlookHook: %s 판정 — 메일 전송 허용 recipients=%s",
+            decision or "unknown (Fail-Open)",
             external_recipients,
         )
-    except Exception as exc:
-        logger.error("임시보관함 이동 실패: %s", exc)
+        return False
 
-    on_blocked(summary, hits, "outlook.exe")
+    # Cancel=True가 실제 전송 취소 수단이다. 저장은 초안 보존을 위한 best-effort이며,
+    # inline reply 등에서 Save가 실패해도 취소 반환값은 유지한다.
+    try:
+        item.Save()
+    except Exception as exc:
+        logger.warning("OutlookHook: 차단 메일 초안 저장 실패: %s", exc)
+
+    logger.warning(
+        "OutlookHook: 메일 차단 — hits=%s recipients=%s",
+        [h.get("id") for h in hits],
+        external_recipients,
+    )
+    return True
 
 
 # ── 공개 클래스 ───────────────────────────────────────────────────────────────
@@ -177,7 +181,7 @@ class OutlookHook:
         self,
         internal_domains: list[str],
         inspect: Callable[[str], list[dict[str, Any]]],
-        on_blocked: Callable[[str, list[dict[str, Any]], str], None],
+        on_blocked: Callable[[str, list[dict[str, Any]], str], Optional[str]],
         file_inspector_extract: Callable[[bytes, str], Optional[str]],
         poll_interval: float = 1.0,
     ) -> None:

@@ -29,6 +29,10 @@ import win32api
 import win32con
 import win32file
 
+from core_comm.analysis_events import record_analysis_result
+from core_comm.payload_builder import AnalysisResult
+from core_comm.review_notifier import notify_review
+
 logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL_SEC   = 2.0    # 드라이브 목록 폴링 주기
@@ -332,27 +336,37 @@ class UsbGuardUserMode:
             result = self._ac.analyze(payload)
             action = result.action
         except Exception as exc:
-            logger.warning("[UsbGuard] AI 판단 실패 → block: %s", exc)
-            action = "block"
+            logger.warning("[UsbGuard] AI 판단 실패 → Fail-Open 허용: %s", exc)
+            result = AnalysisResult(
+                request_id=payload.request_id if payload else "",
+                confidence_score=0.0,
+                action="allow",
+                reason=f"AI 분석 실패: {exc} — Fail-Open 허용",
+                model_version="unavailable",
+                analysis_failed=True,
+            )
+            action = result.action
 
         # 이벤트 로그
-        self._el.log(
-            channel="file_guard",
-            action=action,
-            process_name=f"usb_copy@{drive}",
-            hits=hits,
-            text=text[:500],
-            extra={
-                "event_id":       (payload.request_id if result and payload else None),
-                "ai_score":       (result.confidence_score if result else 1.0),
-                "reason":         (result.reason if result else "USB 민감정보 탐지"),
-                "latency_ms":     (int(result.latency_ms) if result else 0),
-                "detection_type": ("RULE_BASED" if getattr(self._ac, "is_mock", True) else "HYBRID"),
-                "file_path":      file_path,
-                "file_size":      file_size,
-                "drive":          drive,
-            },
-        )
+        try:
+            record_analysis_result(
+                self._el,
+                result,
+                channel="file_guard",
+                process_name=f"usb_copy@{drive}",
+                hits=hits,
+                text=text[:500],
+                event_id=payload.request_id if payload else None,
+                detection_type="RULE_BASED" if getattr(self._ac, "is_mock", True) else "HYBRID",
+                metadata={
+                    "file_path":      file_path,
+                    "file_size":      file_size,
+                    "drive":          drive,
+                },
+            )
+        except Exception:
+            # 저장소·대시보드 오류가 이미 확정된 파일 조치를 바꾸지 않게 한다.
+            logger.exception("[UsbGuard] 분석 결과 기록 실패(파일 조치 유지)")
 
         logger.info("[UsbGuard] AI 판단: action=%s  file=%s", action, file_path)
 
@@ -372,6 +386,10 @@ class UsbGuardUserMode:
                     pass
 
         elif action == "review":
+            try:
+                notify_review("file_guard", file_path, hits)
+            except Exception:
+                logger.exception("[UsbGuard] review 경고 실패(파일 허용 유지)")
             logger.warning("[UsbGuard] review 기록 — 파일 허용: %s", file_path)
 
 

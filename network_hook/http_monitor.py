@@ -48,7 +48,7 @@ class HttpMonitor:
         self,
         inspect_ports: list[int],
         inspect: Callable[[str], list[dict[str, Any]]],
-        on_blocked: Callable[[str, list[dict[str, Any]], str], None],
+        on_blocked: Callable[[str, list[dict[str, Any]], str], str],
         fi_extract: Callable[[bytes, str], Optional[str]],
     ) -> None:
         self._ports = inspect_ports
@@ -123,9 +123,14 @@ class HttpMonitor:
             wd.send(packet)
             return
 
-        # 차단: 패킷을 drop (send 안 함)
         dst = f"{packet.dst_addr}:{packet.dst_port}"
-        self._on_blocked(f"HTTP POST → {dst}", hits, "http_upload")
+        decision = self._on_blocked(f"HTTP POST → {dst}", hits, "http_upload") or "block"
+        if decision != "block":
+            wd.send(packet)
+            logger.warning("HTTP 업로드 %s 경고 기록 — 패킷 통과 → %s", decision, dst)
+            return
+
+        # block 판정: 패킷을 drop (send 안 함)
         logger.warning("HTTP 업로드 차단 → %s  hits=%s", dst, [h.get("id") for h in hits])
         # 패킷을 재전송하지 않으면 연결이 끊어짐(차단 효과)
 

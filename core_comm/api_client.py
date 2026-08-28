@@ -13,6 +13,10 @@ Mock 판단 기준 (AI 서버 confidence_score 스케일 0-1 기준)
   high 패턴만 있음   → block  (confidence 0.75)
   medium만 있음      → review (confidence 0.40)
   low만 있음         → allow  (confidence 0.10)
+
+장애 정책
+---------
+  실제 AI 서버의 타임아웃·통신·응답 오류 → allow (confidence 0.0, Fail-Open)
 """
 
 import logging
@@ -115,18 +119,22 @@ class ApiClient:
             resp.raise_for_status()
             return ResponseParser.parse(resp.json(), payload.request_id)
         except requests.Timeout:
-            logger.error("AI 서버 타임아웃 (%.1fs) — 보수적으로 block 처리", self._timeout)
+            logger.error("AI 서버 타임아웃 (%.1fs) — Fail-Open 허용", self._timeout)
             return AnalysisResult(
                 request_id=payload.request_id,
-                confidence_score=1.0,
-                action="block",
-                reason="AI 서버 타임아웃 — 보수적 차단",
+                confidence_score=0.0,
+                action="allow",
+                reason=f"AI 서버 타임아웃 ({self._timeout:.1f}s) — Fail-Open 허용",
+                model_version="unavailable",
+                analysis_failed=True,
             )
         except Exception as exc:
-            logger.error("AI 서버 오류: %s — block 처리", exc)
+            logger.error("AI 서버 오류: %s — Fail-Open 허용", exc)
             return AnalysisResult(
                 request_id=payload.request_id,
-                confidence_score=1.0,
-                action="block",
-                reason=f"AI 서버 오류: {exc}",
+                confidence_score=0.0,
+                action="allow",
+                reason=f"AI 서버 오류: {exc} — Fail-Open 허용",
+                model_version="unavailable",
+                analysis_failed=True,
             )
