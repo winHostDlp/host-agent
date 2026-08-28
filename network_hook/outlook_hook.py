@@ -59,6 +59,45 @@ def _is_external(recipient_address: str, internal_domains: frozenset[str]) -> bo
     return domain not in internal_domains
 
 
+def _resolve_recipient_address(recipient: Any) -> tuple[str, bool]:
+    """Resolve Exchange legacy addresses to SMTP.
+
+    Returns ``(address, unresolved_exchange)``. An unresolved Exchange address
+    must not be treated as internal merely because its legacy EX value lacks
+    an ``@`` sign.
+    """
+    raw_address = ""
+    try:
+        raw_address = str(recipient.Address or "").strip()
+    except Exception:
+        pass
+
+    entry = None
+    entry_type = ""
+    try:
+        entry = recipient.AddressEntry
+        entry_type = str(entry.Type or "").upper()
+    except Exception:
+        pass
+
+    is_exchange = entry_type == "EX" or raw_address.upper().startswith("/O=")
+    if not is_exchange:
+        return raw_address, False
+
+    if entry is not None:
+        for resolver_name in ("GetExchangeUser", "GetExchangeDistributionList"):
+            try:
+                resolver = getattr(entry, resolver_name)
+                resolved = resolver()
+                smtp = str(getattr(resolved, "PrimarySmtpAddress", "") or "").strip()
+                if "@" in smtp:
+                    return smtp, False
+            except Exception:
+                continue
+
+    return raw_address or "unresolved-exchange-recipient", True
+
+
 def _collect_text(
     item: Any,
     file_inspector_extract: Callable[[bytes, str], Optional[str]],
@@ -117,17 +156,12 @@ def _handle_item_send(
     try:
         for i in range(1, item.Recipients.Count + 1):
             rec = item.Recipients.Item(i)
-            addr: str = ""
-            try:
-                addr = rec.Address
-            except Exception:
-                pass
-            if not addr:
-                try:
-                    addr = rec.AddressEntry.GetExchangeUser().PrimarySmtpAddress
-                except Exception:
-                    pass
-            if addr and _is_external(addr, internal_domains):
+            addr, unresolved_exchange = _resolve_recipient_address(rec)
+            if unresolved_exchange:
+                external_recipients.append(
+                    f"[SMTP 확인 불가 Exchange 수신자: {addr[:200]}]"
+                )
+            elif addr and _is_external(addr, internal_domains):
                 external_recipients.append(addr)
     except Exception:
         pass
@@ -147,8 +181,10 @@ def _handle_item_send(
         logger.debug("OutlookHook: 정규식 미탐지 — 전송 허용")
         return False
 
-    summary = f"수신자: {', '.join(external_recipients)}"
-    decision = on_blocked(summary, hits, "outlook.exe")
+    # 정규식으로 검사한 같은 본문을 AI에도 전달한다. 수신자는
+    # 메일 목적지 문맥을 잃지 않도록 스니펫 앞에 붙인다.
+    analysis_text = f"[외부 수신자: {', '.join(external_recipients)}]\n{text}"
+    decision = on_blocked(analysis_text, hits, "outlook.exe")
     if decision != "block":
         logger.warning(
             "OutlookHook: %s 판정 — 메일 전송 허용 recipients=%s",

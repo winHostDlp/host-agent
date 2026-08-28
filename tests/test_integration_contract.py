@@ -21,10 +21,18 @@ from core_comm.analysis_events import (
     record_analysis_result,
 )
 from core_comm.api_client import ApiClient
-from core_comm.clipboard_analysis import run_clipboard_analysis
+from core_comm.clipboard_analysis import (
+    is_same_paste_destination,
+    run_clipboard_analysis,
+)
 from core_comm.event_logger import EventLogger
 from core_comm.local_store import LocalEventStore
-from core_comm.payload_builder import AnalysisPayload, AnalysisResult, ResponseParser
+from core_comm.payload_builder import (
+    AnalysisPayload,
+    AnalysisResult,
+    PayloadBuilder,
+    ResponseParser,
+)
 from core_comm.review_notifier import build_review_notice
 from network_hook.http_monitor import HttpMonitor
 from network_hook.outlook_hook import _build_sink, _handle_item_send
@@ -423,6 +431,37 @@ def test_clipboard_allow_releases_once_without_notifications():
     review.assert_not_called()
 
 
+def test_clipboard_destination_requires_same_window_and_process():
+    assert is_same_paste_destination(101, "Chrome.EXE", 101, "chrome.exe") is True
+    assert is_same_paste_destination(101, "chrome.exe", 202, "chrome.exe") is False
+    assert is_same_paste_destination(101, "chrome.exe", 101, "notepad.exe") is False
+    assert is_same_paste_destination(0, "chrome.exe", 101, "chrome.exe") is False
+
+
+@pytest.mark.parametrize("action", ["allow", "review"])
+def test_clipboard_failed_release_is_recorded_once_as_warned(action):
+    event_logger = Mock()
+    release = Mock(return_value=False)
+    review = Mock()
+
+    _run_clipboard_worker(
+        action,
+        event_logger=event_logger,
+        release=release,
+        review=review,
+    )
+
+    release.assert_called_once_with()
+    review.assert_not_called()
+    event_logger.log.assert_called_once()
+    logged = event_logger.log.call_args.kwargs
+    assert logged["action"] == "review"
+    assert logged["extra"]["event_id"] == "clipboard-event-1"
+    assert logged["extra"]["ai_score"] == 0.3
+    assert logged["extra"]["model_version"] == "koelectra-dlp-v7"
+    assert "붙여넣기 재발행 미수행" in logged["extra"]["reason"]
+
+
 def test_clipboard_confirmed_block_does_not_release():
     release, blocked, review = _run_clipboard_worker("block")
 
@@ -601,18 +640,110 @@ def test_http_decision_survives_event_and_notifier_failures(
     assert sender.send.call_count == expected_send_count
 
 
-def _outlook_mail_item(save=None):
+def _outlook_mail_item(save=None, body="", attachments=None):
     recipient = SimpleNamespace(Address="outside@example.com")
     recipients = SimpleNamespace(Count=1, Item=lambda index: recipient)
     return SimpleNamespace(
         Class=43,
         Recipients=recipients,
+        Body=body,
+        Attachments=attachments or SimpleNamespace(Count=0),
         Save=save or Mock(),
         Move=Mock(),
         Application=SimpleNamespace(
             Session=SimpleNamespace(GetDefaultFolder=Mock())
         ),
     )
+
+
+@pytest.mark.parametrize(
+    ("primary_smtp", "expected_recipient"),
+    [
+        ("outside@example.com", "outside@example.com"),
+        ("", "SMTP 확인 불가 Exchange 수신자"),
+    ],
+)
+def test_outlook_exchange_recipient_is_resolved_or_inspected_conservatively(
+    monkeypatch, primary_smtp, expected_recipient
+):
+    monkeypatch.setattr("network_hook.outlook_hook._collect_text", lambda *args: "sensitive")
+    exchange_user = SimpleNamespace(PrimarySmtpAddress=primary_smtp)
+    entry = SimpleNamespace(
+        Type="EX",
+        GetExchangeUser=lambda: exchange_user,
+        GetExchangeDistributionList=lambda: None,
+    )
+    recipient = SimpleNamespace(
+        Address="/O=ORG/OU=EXCHANGE/CN=RECIPIENTS/CN=USER",
+        AddressEntry=entry,
+    )
+    item = _outlook_mail_item()
+    item.Recipients = SimpleNamespace(Count=1, Item=lambda index: recipient)
+    captured = {}
+
+    def capture_recipient_context(text, hits, process):
+        captured["text"] = text
+        return "allow"
+
+    cancelled = _handle_item_send(
+        item=item,
+        internal_domains=frozenset({"internal.example"}),
+        on_blocked=capture_recipient_context,
+        inspect=lambda text: [{"id": "rrn"}],
+        file_inspector_extract=lambda data, name: None,
+    )
+
+    assert cancelled is False
+    assert expected_recipient in captured["text"]
+
+
+def test_outlook_ai_payload_contains_inspected_body_and_attachment_content():
+    sensitive_value = "900101-1234567"
+    body = "외부 공유 메일 본문입니다."
+    attachment = SimpleNamespace(
+        FileName="sensitive.txt",
+        SaveAsFile=lambda path: Path(path).write_bytes(
+            f"첨부 문서의 주민등록번호는 {sensitive_value} 입니다.".encode()
+        ),
+    )
+    attachments = SimpleNamespace(Count=1, Item=lambda index: attachment)
+    hit = {
+        "id": "rrn",
+        "name": "주민등록번호",
+        "severity": "critical",
+        "regex": r"\d{6}-\d{7}",
+    }
+    captured = {}
+
+    def inspect(text):
+        assert sensitive_value in text
+        return [hit]
+
+    def analyze(text, hits, process):
+        captured["payload"] = PayloadBuilder(
+            context_chars=256,
+            user_id="presenter",
+        ).build(text, hits, "outlook", process)
+        return "allow"
+
+    cancelled = _handle_item_send(
+        item=_outlook_mail_item(body=body, attachments=attachments),
+        internal_domains=frozenset({"internal.example"}),
+        on_blocked=analyze,
+        inspect=inspect,
+        file_inspector_extract=lambda data, name: data.decode(),
+    )
+
+    payload = captured["payload"]
+    request = payload.to_dict()
+    assert cancelled is False
+    assert body in request["snippet"]
+    assert "[첨부: sensitive.txt]" in request["snippet"]
+    assert sensitive_value in request["snippet"]
+    assert "outside@example.com" in request["snippet"]
+    assert request["metadata"]["app"] == "outlook.exe"
+    assert request["matched_patterns"] == ["rrn"]
+    assert [match.match for match in payload.matched_patterns] == [sensitive_value]
 
 
 @pytest.mark.parametrize("decision", ["review", "allow", None, "unknown"])
@@ -827,6 +958,82 @@ def _web_flow():
     )
 
 
+def _web_extract_addon(file_inspector):
+    return _DLPAddon(
+        inspect_domains=[],
+        rule_filter=Mock(),
+        payload_builder=Mock(),
+        api_client=Mock(),
+        event_logger=Mock(),
+        file_inspector=file_inspector,
+        log_traffic=False,
+    )
+
+
+def test_dropbox_docx_uses_api_filename_before_generic_binary_detection():
+    body = b"PK\x03\x04docx-content"
+    file_inspector = SimpleNamespace(
+        extract_from_bytes=Mock(return_value="sensitive document text")
+    )
+    addon = _web_extract_addon(file_inspector)
+    flow = SimpleNamespace(
+        request=SimpleNamespace(
+            method="POST",
+            pretty_url="https://content.dropboxapi.com/2/files/upload",
+            pretty_host="content.dropboxapi.com",
+            content=body,
+            headers={
+                "content-type": "application/octet-stream",
+                "dropbox-api-arg": json.dumps({"path": "/reports/sensitive.docx"}),
+            },
+        )
+    )
+
+    extracted = addon._extract_text(flow)
+
+    assert extracted == "sensitive document text"
+    file_inspector.extract_from_bytes.assert_called_once_with(
+        body,
+        "sensitive.docx",
+    )
+
+
+@pytest.mark.parametrize(
+    ("host", "url", "method"),
+    [
+        ("graph.microsoft.com", "https://graph.microsoft.com/v1.0/drive/root:/a.txt:/content", "PUT"),
+        ("upload.box.com", "https://upload.box.com/api/2.0/files/content", "POST"),
+        ("fs.mybox.naver.com", "https://fs.mybox.naver.com/file/upload.api", "POST"),
+    ],
+)
+def test_cloud_service_branch_runs_before_generic_binary_detection(
+    monkeypatch,
+    host,
+    url,
+    method,
+):
+    addon = _web_extract_addon(Mock())
+    extract_binary = Mock(return_value="service-specific extraction")
+    monkeypatch.setattr(addon, "_extract_upload_binary", extract_binary)
+    monkeypatch.setattr(
+        addon,
+        "_is_drive_upload",
+        Mock(side_effect=AssertionError("generic branch ran first")),
+    )
+    flow = SimpleNamespace(
+        request=SimpleNamespace(
+            method=method,
+            pretty_url=url,
+            pretty_host=host,
+            content=b"sensitive content",
+            headers={"content-type": "application/octet-stream"},
+        )
+    )
+
+    assert addon._extract_text(flow) == "service-specific extraction"
+    extract_binary.assert_called_once()
+
+
 @pytest.mark.parametrize(
     ("decision", "expected_status"),
     [("block", 451), ("review", None), ("allow", None)],
@@ -876,6 +1083,55 @@ def test_web_decision_survives_event_and_notifier_failures(
     assert actual_status == expected_status
 
 
+def test_web_block_response_failure_is_recorded_as_warned(monkeypatch):
+    class FailingResponse:
+        @staticmethod
+        def make(status_code, content, headers):
+            raise RuntimeError("response creation failed")
+
+    mitmproxy_module = ModuleType("mitmproxy")
+    http_module = ModuleType("mitmproxy.http")
+    http_module.Response = FailingResponse
+    mitmproxy_module.http = http_module
+    monkeypatch.setitem(sys.modules, "mitmproxy", mitmproxy_module)
+    monkeypatch.setitem(sys.modules, "mitmproxy.http", http_module)
+
+    event_logger = Mock()
+    addon = _DLPAddon(
+        inspect_domains=["mail.example"],
+        rule_filter=SimpleNamespace(match=lambda text: [{"id": "rrn"}]),
+        payload_builder=SimpleNamespace(
+            build=lambda *args: SimpleNamespace(request_id="web-response-failure")
+        ),
+        api_client=SimpleNamespace(
+            is_mock=False,
+            analyze=lambda payload: AnalysisResult(
+                request_id=payload.request_id,
+                confidence_score=0.9,
+                action="block",
+                reason="contract decision",
+                model_version="koelectra-dlp-v7",
+            ),
+        ),
+        event_logger=event_logger,
+        file_inspector=Mock(),
+        log_traffic=False,
+    )
+    monkeypatch.setattr(addon, "_get_dlp_channel", lambda flow: "web_mail")
+    monkeypatch.setattr(addon, "_extract_text", lambda flow: "sensitive content")
+    monkeypatch.setattr("network_hook.web_proxy.notify_review", Mock())
+    flow = _web_flow()
+
+    addon._handle(flow)
+
+    assert flow.response is None
+    event_logger.log.assert_called_once()
+    logged = event_logger.log.call_args.kwargs
+    assert logged["action"] == "review"
+    assert logged["extra"]["event_id"] == "web-response-failure"
+    assert "451 차단 응답 생성 실패" in logged["extra"]["reason"]
+
+
 def _load_usb_guard_with_win32_stubs(monkeypatch):
     win32api = ModuleType("win32api")
     win32con = ModuleType("win32con")
@@ -898,26 +1154,250 @@ def _load_usb_guard_with_win32_stubs(monkeypatch):
     return module
 
 
+_USB_ANALYSIS_FINGERPRINT = (128, 2, 12, 22, 32)
+_USB_CHANGED_FINGERPRINT = (128, 2, 12, 22, 33)
+
+
+def test_usb_file_stability_waits_for_unchanged_size_and_mtime(monkeypatch):
+    usb_guard = _load_usb_guard_with_win32_stubs(monkeypatch)
+    observations = iter(
+        [
+            SimpleNamespace(
+                st_size=64,
+                st_mtime_ns=1,
+                st_ctime_ns=11,
+                st_dev=21,
+                st_ino=31,
+            ),
+            *[
+                SimpleNamespace(
+                    st_size=128,
+                    st_mtime_ns=2,
+                    st_ctime_ns=12,
+                    st_dev=22,
+                    st_ino=32,
+                )
+                for _ in range(5)
+            ],
+        ]
+    )
+    monkeypatch.setattr(usb_guard.os, "stat", lambda path: next(observations))
+    monkeypatch.setattr(usb_guard.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(usb_guard.time, "monotonic", lambda: 0.0)
+
+    assert (
+        usb_guard._wait_for_stable_file("E:\\sensitive.txt")
+        == _USB_ANALYSIS_FINGERPRINT
+    )
+
+
+def test_usb_file_stability_stops_when_file_disappears(monkeypatch, caplog):
+    usb_guard = _load_usb_guard_with_win32_stubs(monkeypatch)
+    monkeypatch.setattr(
+        usb_guard.os,
+        "stat",
+        Mock(side_effect=FileNotFoundError("gone")),
+    )
+
+    with caplog.at_level("WARNING"):
+        assert usb_guard._wait_for_stable_file("E:\\sensitive.txt") is None
+
+    assert "안정화 중 파일이 사라져 검사 종료" in caplog.text
+
+
+def test_usb_file_stability_timeout_is_finite(monkeypatch, caplog):
+    usb_guard = _load_usb_guard_with_win32_stubs(monkeypatch)
+    clock = [0.0]
+    sample = [0]
+
+    def changing_stat(path):
+        sample[0] += 1
+        return SimpleNamespace(
+            st_size=sample[0],
+            st_mtime_ns=sample[0],
+            st_ctime_ns=sample[0],
+            st_dev=1,
+            st_ino=1,
+        )
+
+    def advance(seconds):
+        clock[0] += seconds
+
+    monkeypatch.setattr(usb_guard, "_FILE_STABLE_TIMEOUT_SEC", 0.5)
+    monkeypatch.setattr(usb_guard.os, "stat", changing_stat)
+    monkeypatch.setattr(usb_guard.time, "sleep", advance)
+    monkeypatch.setattr(usb_guard.time, "monotonic", lambda: clock[0])
+
+    with caplog.at_level("WARNING"):
+        assert usb_guard._wait_for_stable_file("E:\\sensitive.txt") is None
+
+    assert clock[0] == 0.5
+    assert "파일 안정화 시간 초과로 검사 종료" in caplog.text
+
+
+def test_usb_unstable_file_is_not_inspected_or_deleted(monkeypatch):
+    usb_guard = _load_usb_guard_with_win32_stubs(monkeypatch)
+    monkeypatch.setattr(usb_guard, "_wait_for_stable_file", lambda path: None)
+    remove = Mock()
+    monkeypatch.setattr(usb_guard.os, "remove", remove)
+
+    guard = usb_guard.UsbGuardUserMode.__new__(usb_guard.UsbGuardUserMode)
+    guard._fi = Mock()
+    guard._inspect_stable_file("E:\\sensitive.txt", "E:")
+
+    guard._fi.extract_from_path.assert_not_called()
+    remove.assert_not_called()
+
+
+def test_usb_file_inspection_deduplicates_inflight_path(monkeypatch):
+    usb_guard = _load_usb_guard_with_win32_stubs(monkeypatch)
+    started = usb_guard.threading.Event()
+    release = usb_guard.threading.Event()
+
+    def inspect_once(file_path, drive):
+        started.set()
+        assert release.wait(1.0)
+
+    guard = usb_guard.UsbGuardUserMode.__new__(usb_guard.UsbGuardUserMode)
+    guard._lock = usb_guard.threading.Lock()
+    guard._inflight_paths = set()
+    guard._inspect_stable_file = Mock(side_effect=inspect_once)
+
+    worker = usb_guard.threading.Thread(
+        target=guard._inspect_file,
+        args=("E:\\sensitive.txt", "E:"),
+    )
+    worker.start()
+    assert started.wait(1.0)
+
+    guard._inspect_file("E:\\sensitive.txt", "E:")
+    assert guard._inspect_stable_file.call_count == 1
+
+    release.set()
+    worker.join(1.0)
+    assert not worker.is_alive()
+
+    guard._inspect_file("E:\\sensitive.txt", "E:")
+    assert guard._inspect_stable_file.call_count == 2
+
+
 @pytest.mark.parametrize(
-    ("decision", "expected_remove_count"),
-    [("block", 1), ("review", 0), ("allow", 0)],
+    (
+        "decision",
+        "delete_state",
+        "remove_error",
+        "expected_remove_count",
+        "expected_log_action",
+        "expected_blocked_notices",
+        "expected_review_notices",
+        "expected_failure_reason",
+    ),
+    [
+        ("block", _USB_ANALYSIS_FINGERPRINT, None, 1, "blocked", 1, 0, None),
+        (
+            "block",
+            _USB_ANALYSIS_FINGERPRINT,
+            FileNotFoundError("already absent"),
+            1,
+            "review",
+            0,
+            1,
+            "삭제 중 파일 없음",
+        ),
+        (
+            "block",
+            _USB_ANALYSIS_FINGERPRINT,
+            PermissionError("file locked"),
+            1,
+            "review",
+            0,
+            1,
+            "USB 파일 삭제 실패",
+        ),
+        (
+            "block",
+            _USB_CHANGED_FINGERPRINT,
+            None,
+            0,
+            "review",
+            0,
+            1,
+            "파일 변경 감지",
+        ),
+        (
+            "block",
+            FileNotFoundError("gone before delete"),
+            None,
+            0,
+            "review",
+            0,
+            1,
+            "삭제 직전 파일 없음",
+        ),
+        (
+            "block",
+            PermissionError("cannot stat"),
+            None,
+            0,
+            "review",
+            0,
+            1,
+            "USB 파일 상태 확인 실패",
+        ),
+        ("review", _USB_ANALYSIS_FINGERPRINT, None, 0, "review", 0, 1, None),
+        ("allow", _USB_ANALYSIS_FINGERPRINT, None, 0, "allowed", 0, 0, None),
+    ],
 )
 def test_usb_file_action_survives_event_and_notifier_failures(
-    monkeypatch, decision, expected_remove_count
+    monkeypatch,
+    decision,
+    delete_state,
+    remove_error,
+    expected_remove_count,
+    expected_log_action,
+    expected_blocked_notices,
+    expected_review_notices,
+    expected_failure_reason,
 ):
     usb_guard = _load_usb_guard_with_win32_stubs(monkeypatch)
-    monkeypatch.setattr(usb_guard.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        usb_guard,
+        "_wait_for_stable_file",
+        lambda path: _USB_ANALYSIS_FINGERPRINT,
+    )
     monkeypatch.setattr(usb_guard.os.path, "isfile", lambda path: True)
-    monkeypatch.setattr(usb_guard.os.path, "getsize", lambda path: 128)
-    remove = Mock()
+    call_order = []
+
+    def read_delete_fingerprint(path):
+        call_order.append("fingerprint")
+        if isinstance(delete_state, BaseException):
+            raise delete_state
+        return delete_state
+
+    fingerprint = Mock(side_effect=read_delete_fingerprint)
+    monkeypatch.setattr(usb_guard, "_read_file_fingerprint", fingerprint)
+
+    def remove_file(path):
+        call_order.append("remove")
+        if remove_error:
+            raise remove_error
+
+    remove = Mock(side_effect=remove_file)
     monkeypatch.setattr(usb_guard.os, "remove", remove)
     review_notice = Mock(side_effect=RuntimeError("review popup unavailable"))
     monkeypatch.setattr(usb_guard, "notify_review", review_notice)
 
     event_logger = Mock()
-    event_logger.log.side_effect = RuntimeError("event store unavailable")
+
+    def fail_event_log(**kwargs):
+        call_order.append("log")
+        raise RuntimeError("event store unavailable")
+
+    event_logger.log.side_effect = fail_event_log
     blocked_notice = Mock(side_effect=RuntimeError("blocked popup unavailable"))
     guard = usb_guard.UsbGuardUserMode.__new__(usb_guard.UsbGuardUserMode)
+    guard._lock = usb_guard.threading.Lock()
+    guard._inflight_paths = set()
     guard._max_size = 1024
     guard._fi = SimpleNamespace(
         extract_from_path=lambda path: "sensitive content long enough for inspection"
@@ -942,7 +1422,29 @@ def test_usb_file_action_survives_event_and_notifier_failures(
     guard._inspect_file("E:\\sensitive.txt", "E:")
 
     assert remove.call_count == expected_remove_count
+    assert event_logger.log.call_count == 1
+    assert event_logger.log.call_args.kwargs["action"] == expected_log_action
+    assert blocked_notice.call_count == expected_blocked_notices
+    assert review_notice.call_count == expected_review_notices
     if decision == "block":
-        blocked_notice.assert_called_once()
-    elif decision == "review":
-        review_notice.assert_called_once()
+        fingerprint.assert_called_once_with("E:\\sensitive.txt")
+        assert call_order.index("fingerprint") < call_order.index("log")
+        if expected_remove_count:
+            assert call_order.index("fingerprint") < call_order.index("remove")
+            assert call_order.index("remove") < call_order.index("log")
+    else:
+        fingerprint.assert_not_called()
+
+    extra = event_logger.log.call_args.kwargs["extra"]
+    assert extra["event_id"] == "usb-decision-1"
+    assert extra["model_version"] == "koelectra-dlp-v7"
+    if expected_log_action == "review" and decision == "block":
+        assert extra["ai_score"] == 0.9
+        assert "실제 차단 미확인" in extra["reason"]
+    if expected_failure_reason:
+        assert expected_failure_reason in extra["reason"]
+    if isinstance(remove_error, FileNotFoundError) or isinstance(
+        delete_state,
+        FileNotFoundError,
+    ):
+        assert "파일 삭제 확인 불가" in extra["reason"]

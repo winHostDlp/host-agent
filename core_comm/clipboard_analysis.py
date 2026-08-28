@@ -7,9 +7,27 @@ exercise the failure paths on any CI host.
 """
 
 import logging
+from dataclasses import replace
 from typing import Any, Callable
 
 from core_comm.analysis_events import record_analysis_result
+
+
+def is_same_paste_destination(
+    expected_hwnd: int,
+    expected_process: str,
+    current_hwnd: int,
+    current_process: str,
+) -> bool:
+    """Return whether a delayed paste still targets the intercepted window."""
+    return bool(
+        expected_hwnd
+        and current_hwnd
+        and expected_hwnd == current_hwnd
+        and expected_process
+        and current_process
+        and expected_process.casefold() == current_process.casefold()
+    )
 
 
 def run_clipboard_analysis(
@@ -34,19 +52,42 @@ def run_clipboard_analysis(
     """
 
     release_attempted = False
+    release_succeeded = False
     block_confirmed = False
 
-    def _release_once() -> None:
-        nonlocal release_attempted
+    def _release_once() -> bool:
+        nonlocal release_attempted, release_succeeded
         if release_attempted:
-            return
+            return release_succeeded
         release_attempted = True
         try:
-            release_paste()
+            # 기존 콜백의 None은 성공으로 간주하되, 훅은 명시적으로
+            # False를 반환해 대상/클립보드 변경과 SendInput 실패를 알린다.
+            release_succeeded = release_paste() is not False
         except Exception:
             # Never retry blindly: a partial SendInput could duplicate a paste.
+            release_succeeded = False
             try:
                 logger.exception("[clipboard] 붙여넣기 재발행 실패")
+            except Exception:
+                pass
+        return release_succeeded
+
+    def _record(result: Any, event_id: str) -> None:
+        try:
+            record_analysis_result(
+                event_logger,
+                result,
+                channel="clipboard",
+                process_name=process_name,
+                hits=hits,
+                text=text,
+                event_id=event_id,
+                detection_type="RULE_BASED" if api_client.is_mock else "HYBRID",
+            )
+        except Exception:
+            try:
+                logger.exception("[clipboard] 분석 결과 기록 실패(판정 유지)")
             except Exception:
                 pass
 
@@ -68,24 +109,8 @@ def run_clipboard_analysis(
         except Exception:
             pass
 
-        try:
-            record_analysis_result(
-                event_logger,
-                result,
-                channel="clipboard",
-                process_name=process_name,
-                hits=hits,
-                text=text,
-                event_id=payload.request_id,
-                detection_type="RULE_BASED" if api_client.is_mock else "HYBRID",
-            )
-        except Exception:
-            try:
-                logger.exception("[clipboard] 분석 결과 기록 실패(판정 유지)")
-            except Exception:
-                pass
-
         if block_confirmed:
+            _record(result, payload.request_id)
             try:
                 notify_blocked(process_name, hits)
             except Exception:
@@ -95,16 +120,38 @@ def run_clipboard_analysis(
                     pass
             return
 
+        # 원래 붙여넣기가 아니라 재발행의 실제 성공 여부를 확인한 뒤
+        # 대시보드 조치를 기록한다. 재발행이 취소되면 AI allow였어도
+        # 실제 붙여넣기는 수행되지 않았으므로 WARNED로 남긴다.
+        released = _release_once()
+        recorded_result = result
+        if not released:
+            reason = result.reason.strip()
+            suffix = "붙여넣기 재발행 미수행(대상 창/클립보드 변경 또는 입력 주입 실패)"
+            recorded_result = replace(
+                result,
+                action="review",
+                reason=f"{reason} — {suffix}" if reason else suffix,
+            )
+            try:
+                logger.warning("[clipboard] %s — WARNED 기록", suffix)
+            except Exception:
+                pass
+
+        _record(recorded_result, payload.request_id)
+
+        if not released:
+            # 기존 review 팝업은 "붙여넣기 허용"으로 표시되므로 사용하지
+            # 않는다. 훅의 경고 로그와 WARNED 이벤트가 실제 결과를 남긴다.
+            return
+
         if result.needs_review:
             logger.warning("[clipboard] review 경고 기록 — 붙여넣기 허용")
-            # Release before opening the popup so it cannot steal focus from
-            # the original paste target.
-            _release_once()
             try:
                 notify_review(process_name, hits)
             except Exception:
                 try:
-                    logger.exception("[clipboard] review 알림 실패(허용 유지)")
+                    logger.exception("[clipboard] review 알림 실패")
                 except Exception:
                     pass
             return
@@ -113,7 +160,6 @@ def run_clipboard_analysis(
             logger.warning("[clipboard] AI 장애 Fail-Open 기록 — 붙여넣기 허용")
         else:
             logger.info("[clipboard] AI allow 기록 — 오탐 복구: 붙여넣기 재발행")
-        _release_once()
     except Exception:
         try:
             logger.exception("[clipboard] 비동기 처리 예외 — Fail-Open 붙여넣기 허용")

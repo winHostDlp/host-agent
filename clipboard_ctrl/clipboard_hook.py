@@ -27,6 +27,7 @@ import win32gui
 import win32process
 
 from clipboard_ctrl.text_extractor import TextExtractor
+from core_comm.clipboard_analysis import is_same_paste_destination
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +134,7 @@ class ClipboardHook:
         # AI allow 판정 후 재붙여넣기할 때 훅이 스스로를 무시하는 플래그
         self._skip_next_paste: bool = False
         self._release_lock = threading.Lock()
+        self._intercepted_destination: Optional[tuple[int, str, int]] = None
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -157,8 +159,7 @@ class ClipboardHook:
 
     # ── Internals ─────────────────────────────────────────────────────────────
 
-    def _get_foreground_process_name(self) -> Optional[str]:
-        hwnd = _user32.GetForegroundWindow()
+    def _get_process_name(self, hwnd: int) -> Optional[str]:
         if not hwnd:
             return None
         _, pid = win32process.GetWindowThreadProcessId(hwnd)
@@ -173,6 +174,23 @@ class ClipboardHook:
             return path.rsplit("\\", 1)[-1].lower()
         except Exception:
             return None
+
+    def get_intercepted_destination(
+        self,
+        clipboard_sequence: int,
+        process_name: str,
+    ) -> int:
+        """Return the HWND captured for the callback currently being handled."""
+        destination = self._intercepted_destination
+        if not destination:
+            return 0
+        hwnd, captured_process, captured_sequence = destination
+        if (
+            captured_sequence == clipboard_sequence
+            and captured_process.casefold() == process_name.casefold()
+        ):
+            return hwnd
+        return 0
 
     def _extract_file_texts(self) -> Optional[str]:
         """클립보드에 CF_HDROP(파일 목록)이 있으면 각 파일 내용을 추출해 반환."""
@@ -202,12 +220,18 @@ class ClipboardHook:
             logger.debug("CF_HDROP 처리 실패: %s", exc)
             return None
 
-    def release_paste(self, expected_sequence: Optional[int] = None) -> bool:
+    def release_paste(
+        self,
+        expected_sequence: Optional[int] = None,
+        expected_hwnd: int = 0,
+        expected_process: str = "",
+    ) -> bool:
         """Keep the original clipboard formats and re-issue Ctrl+V.
 
         Returns ``True`` only when all four keyboard events were injected.
-        If the clipboard changed while AI analysis was pending, no input is
-        injected because it would no longer be the user's original paste.
+        If the clipboard or foreground destination changed while AI analysis
+        was pending, no input is injected because it would no longer be the
+        user's original paste.
         """
         import time
 
@@ -225,6 +249,25 @@ class ClipboardHook:
                     "(expected=%d current=%d)",
                     expected_sequence,
                     current_sequence,
+                )
+                return False
+
+            current_hwnd = int(_user32.GetForegroundWindow() or 0)
+            current_process = self._get_process_name(current_hwnd) or ""
+            if not is_same_paste_destination(
+                expected_hwnd,
+                expected_process,
+                current_hwnd,
+                current_process,
+            ):
+                logger.warning(
+                    "AI 분석 중 붙여넣기 대상 창이 변경됨 — 재발행 취소 "
+                    "(expected_hwnd=%s current_hwnd=%s expected_process=%s "
+                    "current_process=%s)",
+                    expected_hwnd or "unknown",
+                    current_hwnd or "unknown",
+                    expected_process or "unknown",
+                    current_process or "unknown",
                 )
                 return False
 
@@ -288,7 +331,8 @@ class ClipboardHook:
             self._skip_next_paste = False
             return False
 
-        process_name = self._get_foreground_process_name()
+        destination_hwnd = int(_user32.GetForegroundWindow() or 0)
+        process_name = self._get_process_name(destination_hwnd)
         if not process_name:
             return False
 
@@ -325,7 +369,15 @@ class ClipboardHook:
         if not clipboard_sequence:
             clipboard_sequence = current_sequence
 
-        return self._on_text_pasted(normalized, process_name, clipboard_sequence)
+        self._intercepted_destination = (
+            destination_hwnd,
+            process_name,
+            clipboard_sequence,
+        )
+        try:
+            return self._on_text_pasted(normalized, process_name, clipboard_sequence)
+        finally:
+            self._intercepted_destination = None
 
     def _keyboard_hook_proc(
         self, n_code: int, w_param: int, l_param: int

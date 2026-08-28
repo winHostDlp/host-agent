@@ -21,6 +21,7 @@ import logging
 import os
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -35,15 +36,65 @@ from core_comm.review_notifier import notify_review
 
 logger = logging.getLogger(__name__)
 
-_POLL_INTERVAL_SEC   = 2.0    # 드라이브 목록 폴링 주기
-_WRITE_SETTLE_SEC    = 2.0    # 파일 쓰기 완료 대기 시간 (rename 후 flush 포함)
-_MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024   # 50 MB 초과 파일은 건너뜀
-_MIN_TEXT_LEN        = 20     # 추출 텍스트가 이 미만이면 검사 생략
+_POLL_INTERVAL_SEC       = 2.0
+_FILE_STABLE_INTERVAL_SEC = 0.25
+_FILE_STABLE_SAMPLES     = 5
+_FILE_STABLE_TIMEOUT_SEC = 15.0
+_MAX_FILE_SIZE_BYTES     = 50 * 1024 * 1024
+_MIN_TEXT_LEN            = 20
 
 # 모니터링 대상 드라이브 타입
 # DRIVE_REMOVABLE(2): USB 플래시드라이브 → 항상 감시
 # DRIVE_FIXED(3): 일부 USB는 Windows에서 Fixed로 보고됨 → 내장 기준 파일로 구분
 _MONITOR_TYPES = {win32con.DRIVE_REMOVABLE, win32con.DRIVE_FIXED}
+_FileFingerprint = tuple[int, int, int, int, int]
+
+
+def _stat_fingerprint(stat: Any) -> _FileFingerprint:
+    return (
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+        stat.st_dev,
+        stat.st_ino,
+    )
+
+
+def _read_file_fingerprint(file_path: str) -> _FileFingerprint:
+    return _stat_fingerprint(os.stat(file_path))
+
+
+def _wait_for_stable_file(file_path: str) -> Optional[_FileFingerprint]:
+    """파일 크기·수정 시간이 연속으로 같을 때 분석 전 지문을 반환한다."""
+    deadline = time.monotonic() + _FILE_STABLE_TIMEOUT_SEC
+    previous: Optional[tuple[int, int]] = None
+    stable_samples = 0
+
+    while True:
+        try:
+            stat = os.stat(file_path)
+        except FileNotFoundError:
+            logger.warning("[UsbGuard] 안정화 중 파일이 사라져 검사 종료: %s", file_path)
+            return None
+        except OSError as exc:
+            logger.warning("[UsbGuard] 파일 상태 확인 실패로 검사 종료 %s: %s", file_path, exc)
+            return None
+
+        current = (stat.st_size, stat.st_mtime_ns)
+        if current == previous:
+            stable_samples += 1
+        else:
+            previous = current
+            stable_samples = 1
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            logger.warning("[UsbGuard] 파일 안정화 시간 초과로 검사 종료: %s", file_path)
+            return None
+        if stable_samples >= _FILE_STABLE_SAMPLES:
+            return _stat_fingerprint(stat)
+        time.sleep(min(_FILE_STABLE_INTERVAL_SEC, remaining))
+
 
 class UsbGuardUserMode:
     """
@@ -80,6 +131,7 @@ class UsbGuardUserMode:
 
         self._stop_ev     = threading.Event()
         self._watched:    dict[str, threading.Event] = {}  # drive → stop event
+        self._inflight_paths: set[str] = set()
         self._lock        = threading.Lock()
         self._poll_thread: Optional[threading.Thread] = None
         # 설치 시 기록된 이 PC의 내장 드라이브만 신뢰한다.
@@ -243,15 +295,27 @@ class UsbGuardUserMode:
     # ── DLP 검사 ─────────────────────────────────────────────────────────────
 
     def _inspect_file(self, file_path: str, drive: str) -> None:
-        # 쓰기 완료까지 대기
-        time.sleep(_WRITE_SETTLE_SEC)
-
-        if not os.path.isfile(file_path):
-            return
+        path_key = os.path.normcase(os.path.abspath(file_path))
+        with self._lock:
+            if path_key in self._inflight_paths:
+                logger.debug("[UsbGuard] 중복 검사 생략: %s", file_path)
+                return
+            self._inflight_paths.add(path_key)
 
         try:
-            file_size = os.path.getsize(file_path)
-        except OSError:
+            self._inspect_stable_file(file_path, drive)
+        finally:
+            with self._lock:
+                self._inflight_paths.discard(path_key)
+
+    def _inspect_stable_file(self, file_path: str, drive: str) -> None:
+        analysis_fingerprint = _wait_for_stable_file(file_path)
+        if analysis_fingerprint is None:
+            return
+        file_size = analysis_fingerprint[0]
+
+        if not os.path.isfile(file_path):
+            logger.warning("[UsbGuard] 안정화 후 파일이 사라져 검사 종료: %s", file_path)
             return
 
         if file_size == 0 or file_size > self._max_size:
@@ -303,11 +367,85 @@ class UsbGuardUserMode:
             )
             action = result.action
 
-        # 이벤트 로그
+        logger.info("[UsbGuard] AI 판단: action=%s  file=%s", action, file_path)
+
+        record_result = result
+        if action == "block":
+            # 분석한 파일과 같은 대상인지 확인한 뒤 USB에서 삭제한다.
+            blocked = False
+            delete_failure: Optional[str] = None
+            try:
+                delete_fingerprint = _read_file_fingerprint(file_path)
+            except FileNotFoundError:
+                delete_failure = (
+                    "AI block 판단 후 삭제 직전 파일 없음; "
+                    "파일 삭제 확인 불가, 실제 차단 미확인, 경고 후 허용"
+                )
+                logger.error("[UsbGuard] 삭제 직전 파일이 없어 삭제 확인 불가: %s", file_path)
+            except OSError as exc:
+                delete_failure = (
+                    "AI block 판단 후 USB 파일 상태 확인 실패"
+                    f"({type(exc).__name__}); 실제 차단 미확인, 경고 후 허용"
+                )
+                logger.error("[UsbGuard] 삭제 직전 파일 상태 확인 실패 %s: %s", file_path, exc)
+            else:
+                if delete_fingerprint != analysis_fingerprint:
+                    delete_failure = (
+                        "AI block 판단 후 파일 변경 감지; "
+                        "다른 대상 삭제 방지를 위해 삭제 중단, "
+                        "실제 차단 미확인, 경고 후 허용"
+                    )
+                    logger.error("[UsbGuard] 분석 후 파일 변경으로 삭제 중단: %s", file_path)
+                else:
+                    try:
+                        os.remove(file_path)
+                    except FileNotFoundError:
+                        delete_failure = (
+                            "AI block 판단 후 삭제 중 파일 없음; "
+                            "파일 삭제 확인 불가, 실제 차단 미확인, 경고 후 허용"
+                        )
+                        logger.error("[UsbGuard] 삭제 중 파일이 없어 삭제 확인 불가: %s", file_path)
+                    except OSError as exc:
+                        delete_failure = (
+                            "AI block 판단 후 USB 파일 삭제 실패"
+                            f"({type(exc).__name__}); 실제 차단 미확인, 경고 후 허용"
+                        )
+                        logger.error("[UsbGuard] 삭제 실패 %s: %s", file_path, exc)
+                    else:
+                        blocked = True
+                        logger.warning("[UsbGuard] 삭제 완료: %s", file_path)
+
+            if delete_failure:
+                failure_reason = " — ".join(filter(None, (
+                    result.reason,
+                    delete_failure,
+                )))
+                record_result = replace(result, action="review", reason=failure_reason)
+                try:
+                    notify_review("file_guard", file_path, hits)
+                except Exception:
+                    logger.exception("[UsbGuard] 차단 미확인 경고 표시 실패(파일 허용 유지)")
+
+            if blocked:
+                # 사용자 알림
+                if self._on_blocked:
+                    try:
+                        self._on_blocked(file_path, hits)
+                    except Exception:
+                        pass
+
+        elif action == "review":
+            try:
+                notify_review("file_guard", file_path, hits)
+            except Exception:
+                logger.exception("[UsbGuard] review 경고 실패(파일 허용 유지)")
+            logger.warning("[UsbGuard] review 기록 — 파일 허용: %s", file_path)
+
+        # 파일 조치가 확정된 뒤 로컬·대시보드에 한 번만 기록한다.
         try:
             record_analysis_result(
                 self._el,
-                result,
+                record_result,
                 channel="file_guard",
                 process_name=f"usb_copy@{drive}",
                 hits=hits,
@@ -323,30 +461,6 @@ class UsbGuardUserMode:
         except Exception:
             # 저장소·대시보드 오류가 이미 확정된 파일 조치를 바꾸지 않게 한다.
             logger.exception("[UsbGuard] 분석 결과 기록 실패(파일 조치 유지)")
-
-        logger.info("[UsbGuard] AI 판단: action=%s  file=%s", action, file_path)
-
-        if action == "block":
-            # USB에서 민감 파일 삭제
-            try:
-                os.remove(file_path)
-                logger.warning("[UsbGuard] 삭제 완료: %s", file_path)
-            except OSError as exc:
-                logger.error("[UsbGuard] 삭제 실패 %s: %s", file_path, exc)
-
-            # 사용자 알림
-            if self._on_blocked:
-                try:
-                    self._on_blocked(file_path, hits)
-                except Exception:
-                    pass
-
-        elif action == "review":
-            try:
-                notify_review("file_guard", file_path, hits)
-            except Exception:
-                logger.exception("[UsbGuard] review 경고 실패(파일 허용 유지)")
-            logger.warning("[UsbGuard] review 기록 — 파일 허용: %s", file_path)
 
 
 # ── 유틸 ─────────────────────────────────────────────────────────────────────

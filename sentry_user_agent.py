@@ -3,9 +3,11 @@
 담당 채널 (로그온한 사용자 세션에서 실행, 데스크탑 접근 필요)
   - 클립보드 훅    : WH_KEYBOARD_LL + 붙여넣기 목적지 검사
   - Outlook 훅     : COM ItemSend 이벤트 (사용자의 Outlook 인스턴스)
+  - FileGuard      : USB 이동식 드라이브 파일 감시·사용자 알림
+  - WebProxy       : 현재 사용자의 HTTPS 시스템 프록시 트래픽 검사
   - 알림 팝업      : 차단 시 화면 중앙 팝업 (Tkinter)
 
-시스템 채널 (SMTP, HTTP, FileGuard)은
+시스템 채널 (SMTP, HTTP)은
 sentry_service.py (Windows 서비스, Session 0)가 담당.
 
 ────────────────────────────────────────────────────────────

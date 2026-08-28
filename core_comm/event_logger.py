@@ -27,6 +27,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from time import sleep
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -170,7 +171,7 @@ class EventLogger:
         if self._send_immediately:
             payload = self._build_log_payload(channel, action, process_name, hits, text, extra)
             threading.Thread(
-                target=self._post,
+                target=self._post_immediately,
                 args=(payload,),
                 daemon=True,
                 name="EventSender",
@@ -304,3 +305,24 @@ class EventLogger:
         except Exception as exc:
             logger.warning("Event POST 실패 (로컬에는 저장됨): %s", exc)
             return False
+
+    def _post_immediately(self, payload: dict[str, Any]) -> bool:
+        """Retry a live dashboard post briefly without blocking channel actions."""
+        delays = (0.0, 0.25, 0.75)
+        for attempt, delay in enumerate(delays, start=1):
+            if delay:
+                sleep(delay)
+            if self._post(payload):
+                return True
+            if attempt < len(delays):
+                logger.warning(
+                    "Event POST 재시도 예정 (%d/%d) event_id=%s",
+                    attempt,
+                    len(delays),
+                    payload.get("event_id"),
+                )
+        logger.error(
+            "Event POST 최종 실패 — 로컬 JSONL 보존 event_id=%s",
+            payload.get("event_id"),
+        )
+        return False

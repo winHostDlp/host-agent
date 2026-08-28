@@ -3,9 +3,8 @@
 담당 채널 (Session 0, 데스크탑 불필요)
   - SMTP 프록시     : 로컬 SMTP 트래픽 감시
   - HTTP 모니터     : WinDivert HTTP 업로드 감시
-  - FileGuard       : 미니필터 드라이버를 통한 USB·네트워크공유 파일 감시
 
-사용자 세션 채널 (클립보드, Outlook, 알림)은
+사용자 세션 채널 (클립보드, Outlook, FileGuard, WebProxy, 알림)은
 sentry_user_agent.py (Task Scheduler 로그온 트리거)가 담당.
 
 ────────────────────────────────────────────────────────────
@@ -61,13 +60,14 @@ def _configure_file_logging() -> None:
 
 
 class SentryDLPService(win32serviceutil.ServiceFramework):
-    """Sentry DLP 시스템 서비스 — Session 0 채널(SMTP, HTTP, FileGuard)을 관리."""
+    """Sentry DLP 시스템 서비스 — Session 0 채널(SMTP, HTTP)을 관리."""
 
     _svc_name_        = "SentryDLPService"
     _svc_display_name_= "Sentry DLP Service"
     _svc_description_ = (
-        "Data Loss Prevention — USB/네트워크공유 파일 감시, SMTP/HTTP 모니터링. "
-        "사용자 세션 채널(클립보드, Outlook)은 sentry_user_agent가 담당합니다."
+        "Data Loss Prevention — SMTP/HTTP 모니터링. "
+        "사용자 세션 채널(클립보드, Outlook, FileGuard, WebProxy)은 "
+        "sentry_user_agent가 담당합니다."
     )
     # 자동 시작 + 크래시 시 재시작 (setup_agent.ps1에서 SC failure 설정)
     _svc_start_type_  = win32service.SERVICE_AUTO_START

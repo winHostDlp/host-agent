@@ -15,6 +15,7 @@ import logging
 import re
 import threading
 import urllib.parse
+from dataclasses import replace
 from email import message_from_bytes
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -391,38 +392,57 @@ class _DLPAddon:
             result.action, result.confidence_score, flow.request.pretty_url,
         )
 
-        try:
-            record_analysis_result(
-                self._event_logger,
-                result,
-                channel=channel,
-                process_name=process_name,
-                hits=hits,
-                text=text,
-                event_id=payload.request_id,
-                detection_type="RULE_BASED" if getattr(self._api, "is_mock", True) else "HYBRID",
-                metadata={"url": flow.request.pretty_url},
-            )
-        except Exception:
-            # 로컬 저장소·대시보드 기록 장애는 AI 판정을 바꾸지 않는다.
-            logger.exception("[WebProxy] 분석 결과 기록 실패(판정 유지)")
+        def _record(final_result: Any) -> None:
+            try:
+                record_analysis_result(
+                    self._event_logger,
+                    final_result,
+                    channel=channel,
+                    process_name=process_name,
+                    hits=hits,
+                    text=text,
+                    event_id=payload.request_id,
+                    detection_type=(
+                        "RULE_BASED" if getattr(self._api, "is_mock", True) else "HYBRID"
+                    ),
+                    metadata={"url": flow.request.pretty_url},
+                )
+            except Exception:
+                # 로컬 저장소·대시보드 기록 장애는 이미 확정된 HTTP 조치를 바꾸지 않는다.
+                logger.exception("[WebProxy] 분석 결과 기록 실패(판정 유지)")
 
         if result.should_block:
             # 차단 응답을 먼저 확정한다. 이후 팝업이 실패해도 451은 유지된다.
-            pattern_names = ", ".join(h.get("name", h.get("id", "")) for h in hits)
-            html = _BLOCK_HTML.format(
-                reason=result.reason or "민감정보 탐지",
-                patterns=pattern_names,
-            )
-            flow.response = Response.make(
-                451,
-                html.encode("utf-8"),
-                {
-                    "Content-Type":  "text/html; charset=utf-8",
-                    "X-DLP-Blocked": "1",
-                    "Cache-Control": "no-store",
-                },
-            )
+            try:
+                pattern_names = ", ".join(h.get("name", h.get("id", "")) for h in hits)
+                html = _BLOCK_HTML.format(
+                    reason=result.reason or "민감정보 탐지",
+                    patterns=pattern_names,
+                )
+                flow.response = Response.make(
+                    451,
+                    html.encode("utf-8"),
+                    {
+                        "Content-Type":  "text/html; charset=utf-8",
+                        "X-DLP-Blocked": "1",
+                        "Cache-Control": "no-store",
+                    },
+                )
+            except Exception as exc:
+                failure = (
+                    f"HTTP 451 차단 응답 생성 실패({type(exc).__name__}); "
+                    "실제 차단 미확인, 경고 후 허용"
+                )
+                reason = " — ".join(filter(None, (result.reason, failure)))
+                _record(replace(result, action="review", reason=reason))
+                logger.exception("[WebProxy] 451 응답 생성 실패 — WARNED 기록")
+                try:
+                    notify_review(channel, flow.request.pretty_url, hits)
+                except Exception:
+                    logger.exception("[WebProxy] 451 실패 경고 표시 실패")
+                return
+
+            _record(result)
 
             # 같은 호스트 60초 내 팝업 1회만 (재시도/동시다발 차단 팝업 폭탄 방지)
             if self._on_blocked:
@@ -443,6 +463,7 @@ class _DLPAddon:
                     logger.exception("[WebProxy] 차단 팝업 실패(451 차단 유지)")
             return
 
+        _record(result)
         if result.needs_review:
             try:
                 notify_review(channel, flow.request.pretty_url, hits)
@@ -587,21 +608,7 @@ class _DLPAddon:
             if extracted and extracted.strip():
                 return extracted
 
-        # ── 파일 업로드 바이너리 (Gmail 첨부 + Drive 웹/API) ───────────────────
-        is_binary_upload = (
-            "upload_id=" in url_lower
-            or "/_/upload" in url_lower
-            or "/upload/drive" in url_lower
-            or "/upload/resumable" in url_lower
-            or "upload" in cmd
-            or "finalize" in cmd
-            or self._is_drive_upload(flow)
-        )
-        if is_binary_upload and (
-            self._is_drive_target(host) or "upload_id=" in url_lower or "/_/upload" in url_lower
-        ):
-            return self._extract_upload_binary(flow, body, ct) or ""
-
+        # 서비스별 업로드를 먼저 처리해 헤더·경로의 파일명을 보존한다.
         # ── Dropbox 업로드: Dropbox-API-Arg 헤더에서 파일명 추출 ───────────────
         if "dropboxapi.com" in host and "/2/files/upload" in url_lower:
             return self._extract_dropbox_upload(flow, body, ct)
@@ -622,6 +629,21 @@ class _DLPAddon:
         if "mybox.naver.com" in host:
             if "multipart" in ct:
                 return self._from_multipart(body, ct)
+            return self._extract_upload_binary(flow, body, ct) or ""
+
+        # 일반 Gmail/Drive 바이너리 업로드 fallback.
+        is_binary_upload = (
+            "upload_id=" in url_lower
+            or "/_/upload" in url_lower
+            or "/upload/drive" in url_lower
+            or "/upload/resumable" in url_lower
+            or "upload" in cmd
+            or "finalize" in cmd
+            or self._is_drive_upload(flow)
+        )
+        if is_binary_upload and (
+            self._is_drive_target(host) or "upload_id=" in url_lower or "/_/upload" in url_lower
+        ):
             return self._extract_upload_binary(flow, body, ct) or ""
 
         # ── 일반 경로 (웹메일 본문 텍스트 등) ────────────────────────────────

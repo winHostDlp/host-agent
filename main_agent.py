@@ -22,9 +22,10 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import yaml
 
@@ -174,6 +175,11 @@ def build_clipboard_hook(
         if not hits:
             return False
 
+        destination_hwnd = hook_ref[0].get_intercepted_destination(
+            clipboard_sequence,
+            process_name,
+        )
+
         def _ai_then_notify() -> None:
             hook = hook_ref[0]
             if hook is None:
@@ -187,7 +193,11 @@ def build_clipboard_hook(
                 payload_builder=payload_builder,
                 api_client=api_client,
                 event_logger=event_logger,
-                release_paste=lambda: hook.release_paste(clipboard_sequence),
+                release_paste=lambda: hook.release_paste(
+                    clipboard_sequence,
+                    destination_hwnd,
+                    process_name,
+                ),
                 notify_blocked=notify_blocked,
                 notify_review=notify_clipboard_review,
                 logger=logger,
@@ -339,11 +349,13 @@ def build_web_proxy(
 # ── 채널 분류 ──────────────────────────────────────────────────────────────────
 #
 # SESSION_0_CHANNELS : Windows 서비스(Session 0)에서 실행 가능
-#   smtp, http, file_guard
+#   smtp, http
 #
 # USER_SESSION_CHANNELS : 로그온 사용자 세션에서만 동작
 #   clipboard (WH_KEYBOARD_LL + 메시지 펌프)
 #   outlook   (COM 객체 — 사용자 Outlook 인스턴스 접근 필요)
+#   file_guard (USB 감시 + 사용자 알림)
+#   web_proxy (현재 사용자의 시스템 프록시)
 #
 # mode="all"    : 개발·테스트용. 모든 채널 시작 (단일 프로세스)
 # mode="system" : sentry_service.py 가 호출. Session 0 채널만 시작
@@ -529,8 +541,13 @@ def run(mode: str = "all", stop_event: Optional["threading.Event"] = None) -> No
         _shutdown()
         sys.exit(0)
 
-    signal.signal(signal.SIGINT,  _sig_handler)
-    signal.signal(signal.SIGTERM, _sig_handler)
+    # Windows 서비스는 run()을 작업 스레드에서 호출한다. signal 등록은
+    # Python 메인 스레드에서만 허용되며, 서비스 종료는 stop_event가 담당한다.
+    if _threading.current_thread() is _threading.main_thread():
+        signal.signal(signal.SIGINT,  _sig_handler)
+        signal.signal(signal.SIGTERM, _sig_handler)
+    else:
+        logger.debug("메인 스레드가 아니므로 OS signal handler 등록 생략")
 
     try:
         if stop_event is not None:
@@ -544,11 +561,6 @@ def run(mode: str = "all", stop_event: Optional["threading.Event"] = None) -> No
         pass
     finally:
         _shutdown()
-
-
-# Optional import — threading은 표준 라이브러리이므로 실제로는 항상 사용 가능
-import threading
-from typing import Optional
 
 
 def main() -> None:
