@@ -22,6 +22,9 @@ VIEWER_PASSWORD = "viewer-password-never-print"
 VIEWER_AUTHORIZATION = "Basic " + base64.b64encode(
     f"{VIEWER_USERNAME}:{VIEWER_PASSWORD}".encode()
 ).decode()
+CHECKPOINT_SHA256 = "a" * 64
+BLOCK_THRESHOLD = 0.41
+REVIEW_THRESHOLD = 0.20
 
 
 def _handler(state: dict[str, Any]) -> type[BaseHTTPRequestHandler]:
@@ -86,6 +89,31 @@ def _handler(state: dict[str, Any]) -> type[BaseHTTPRequestHandler]:
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
+            if parsed.path == "/":
+                state["ai_health_authorization"] = self.headers.get("Authorization")
+                status = state.get("ai_health_http_status", 200)
+                body = {
+                    "status": "running",
+                    "engine": "koelectra-dlp-v7",
+                    "auth_required": True,
+                    "checkpoint_sha256": CHECKPOINT_SHA256,
+                    "block_threshold": BLOCK_THRESHOLD,
+                    "review_threshold": REVIEW_THRESHOLD,
+                }
+                body.update(state.get("ai_health_overrides", {}))
+                self._send(status, body)
+                return
+            if parsed.path == "/health":
+                state["web_health_authorization"] = self.headers.get("Authorization")
+                status = state.get("web_health_http_status", 200)
+                body = {
+                    "status": "ok",
+                    "database_status": "ok",
+                    "dashboard_auth_enabled": True,
+                }
+                body.update(state.get("web_health_overrides", {}))
+                self._send(status, body)
+                return
             if parsed.path != "/api/v1/logs":
                 self._send(404, {"detail": "not found"})
                 return
@@ -163,6 +191,23 @@ logging:
     )
 
 
+def _valid_ood_result(**overrides: Any) -> dict[str, Any]:
+    result = {
+        "status": "passed",
+        "gate": "blind_ood_final_v1",
+        "model_version": "koelectra-dlp-v7",
+        "quality_passed": True,
+        "checkpoint_sha256": CHECKPOINT_SHA256,
+        "block_threshold": BLOCK_THRESHOLD,
+        "review_threshold": REVIEW_THRESHOLD,
+        "minimum_f1": 0.90,
+        "minimum_recall": 0.90,
+        "metrics": {"f1": 0.95, "recall": 0.96},
+    }
+    result.update(overrides)
+    return result
+
+
 def _run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -170,6 +215,7 @@ def _run(
     state: dict[str, Any],
     evidence_root: Path | None = None,
     viewer_auth: bool = True,
+    ood_result: dict[str, Any] | None = None,
 ) -> tuple[int, dict[str, Any], str]:
     with _http_server(state) as base_url:
         _write_project(tmp_path, base_url)
@@ -184,23 +230,26 @@ def _run(
         argv = ["--project-root", str(tmp_path)]
         if evidence_root is not None:
             argv.extend(["--evidence-root", str(evidence_root)])
+        if ood_result is not None:
+            ood_result_path = tmp_path / "ood-result.json"
+            ood_result_path.write_text(json.dumps(ood_result), encoding="utf-8")
+            argv.extend(["--ood-result", str(ood_result_path)])
         result = verify_live_pipeline.main(argv)
     captured = capsys.readouterr()
     return result, json.loads(captured.out), captured.out + captured.err
 
 
 @pytest.mark.parametrize(
-    ("custom_evidence", "viewer_auth"),
-    [(False, True), (True, True), (False, False)],
+    "custom_evidence",
+    [False, True],
 )
 def test_live_pipeline_uses_real_http_headers_and_one_event_id(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     custom_evidence: bool,
-    viewer_auth: bool,
 ) -> None:
-    state: dict[str, Any] = {"require_viewer_auth": viewer_auth}
+    state: dict[str, Any] = {"require_viewer_auth": True}
     evidence_root = tmp_path / "custom-evidence" if custom_evidence else None
 
     result, output, all_output = _run(
@@ -209,7 +258,6 @@ def test_live_pipeline_uses_real_http_headers_and_one_event_id(
         capsys,
         state,
         evidence_root,
-        viewer_auth,
     )
 
     assert result == 0
@@ -217,14 +265,18 @@ def test_live_pipeline_uses_real_http_headers_and_one_event_id(
     assert output["scope"] == "SERVER_PIPELINE"
     assert output["windows_hook_e2e"] is False
     assert output["model_version"] == "koelectra-dlp-v7"
+    assert output["checkpoint_sha256"] == CHECKPOINT_SHA256
+    assert output["block_threshold"] == BLOCK_THRESHOLD
+    assert output["review_threshold"] == REVIEW_THRESHOLD
+    assert output["ood_bound"] is False
+    assert output["ood_result_sha256"] is None
     assert output["event_id"] == state["ai_request"]["event_id"]
     assert output["event_id"] == state["web_request"]["event_id"]
     assert state["ai_authorization"] == f"Bearer {AI_TOKEN}"
+    assert state["ai_health_authorization"] == f"Bearer {AI_TOKEN}"
     assert state["web_token"] == WEB_TOKEN
     assert state["readback_token"] == WEB_TOKEN
-    assert state["readback_authorization"] == (
-        VIEWER_AUTHORIZATION if viewer_auth else None
-    )
+    assert state["readback_authorization"] == VIEWER_AUTHORIZATION
     assert state["readback_query"]["q"] == [output["event_id"]]
     assert state["readback_query"]["limit"] == ["50"]
     assert state["ai_request"]["matched_patterns"] == [
@@ -254,11 +306,37 @@ def test_live_pipeline_uses_real_http_headers_and_one_event_id(
     ).hexdigest()
     assert evidence_record["hits"][0]["id"] == verify_live_pipeline.MARKER_PATTERN_ID
     assert evidence_record["extra"]["event_id"] == output["event_id"]
+    assert evidence_record["extra"]["checkpoint_sha256"] == CHECKPOINT_SHA256
+    assert evidence_record["extra"]["block_threshold"] == BLOCK_THRESHOLD
+    assert evidence_record["extra"]["review_threshold"] == REVIEW_THRESHOLD
+    assert evidence_record["extra"]["ood_bound"] is False
+    assert evidence_record["extra"]["ood_result_sha256"] is None
 
 
 @pytest.mark.parametrize(
     ("state", "error_code"),
     [
+        ({"ai_health_http_status": 503}, "AI_HEALTH_FAILED"),
+        ({"ai_health_overrides": {"status": "ok"}}, "AI_HEALTH_INVALID"),
+        ({"ai_health_overrides": {"engine": "onnx"}}, "AI_HEALTH_INVALID"),
+        (
+            {"ai_health_overrides": {"status": "model_load_failed"}},
+            "AI_HEALTH_INVALID",
+        ),
+        ({"ai_health_overrides": {"auth_required": False}}, "AI_HEALTH_INVALID"),
+        ({"ai_health_overrides": {"checkpoint_sha256": "A" * 64}}, "AI_HEALTH_INVALID"),
+        ({"ai_health_overrides": {"block_threshold": True}}, "AI_HEALTH_INVALID"),
+        (
+            {"ai_health_overrides": {"review_threshold": BLOCK_THRESHOLD}},
+            "AI_HEALTH_INVALID",
+        ),
+        ({"web_health_http_status": 503}, "WEB_HEALTH_FAILED"),
+        ({"web_health_overrides": {"status": "degraded"}}, "WEB_HEALTH_INVALID"),
+        ({"web_health_overrides": {"database_status": "error"}}, "WEB_HEALTH_INVALID"),
+        (
+            {"web_health_overrides": {"dashboard_auth_enabled": False}},
+            "WEB_HEALTH_INVALID",
+        ),
         ({"ai_event_id": "wrong-event-id"}, "AI_RESPONSE_INVALID"),
         ({"model_version": "unexpected-model"}, "AI_RESPONSE_INVALID"),
         ({"ai_status": 500}, "AI_RESPONSE_INVALID"),
@@ -282,7 +360,11 @@ def test_live_pipeline_fails_closed_on_contract_and_http_errors(
     assert output["scope"] == "SERVER_PIPELINE"
     assert output["status"] == "FAIL"
     assert output["windows_hook_e2e"] is False
-    if error_code.startswith("WEB_"):
+    if error_code in {
+        "WEB_RECEIPT_INVALID",
+        "WEB_READBACK_FAILED",
+        "WEB_READBACK_INVALID",
+    }:
         evidence_path = Path(output["evidence_path"])
         assert evidence_path.exists()
         assert output["evidence_sha256"] == hashlib.sha256(
@@ -301,6 +383,7 @@ def test_live_pipeline_fails_closed_on_contract_and_http_errors(
 @pytest.mark.parametrize(
     ("viewer_username", "viewer_password"),
     [
+        (None, None),
         (VIEWER_USERNAME, None),
         (None, VIEWER_PASSWORD),
         ("viewer-한글", VIEWER_PASSWORD),
@@ -360,8 +443,8 @@ def test_live_pipeline_keeps_explicit_evidence_without_overwriting_existing_fold
         _write_project(tmp_path, base_url)
         monkeypatch.setenv("AI_API_TOKEN", AI_TOKEN)
         monkeypatch.setenv("AGENT_API_TOKEN", WEB_TOKEN)
-        monkeypatch.delenv("DASHBOARD_VIEWER_USERNAME", raising=False)
-        monkeypatch.delenv("DASHBOARD_VIEWER_PASSWORD", raising=False)
+        monkeypatch.setenv("DASHBOARD_VIEWER_USERNAME", VIEWER_USERNAME)
+        monkeypatch.setenv("DASHBOARD_VIEWER_PASSWORD", VIEWER_PASSWORD)
         result = verify_live_pipeline.main(
             [
                 "--project-root",
@@ -377,3 +460,71 @@ def test_live_pipeline_keeps_explicit_evidence_without_overwriting_existing_fold
     assert "evidence_path" not in output
     assert sentinel.read_text(encoding="utf-8") == "keep"
     assert sorted(path.name for path in existing_dir.iterdir()) == ["keep.txt"]
+
+
+def test_live_pipeline_binds_a_passed_ood_result_to_live_health(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state: dict[str, Any] = {"require_viewer_auth": True}
+    ood_result = _valid_ood_result()
+
+    result, output, _ = _run(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        state,
+        ood_result=ood_result,
+    )
+
+    ood_path = tmp_path / "ood-result.json"
+    assert result == 0
+    assert output["ood_bound"] is True
+    assert output["ood_result_sha256"] == hashlib.sha256(ood_path.read_bytes()).hexdigest()
+    evidence = json.loads(Path(output["evidence_path"]).read_text(encoding="utf-8"))
+    assert evidence["extra"]["ood_bound"] is True
+    assert evidence["extra"]["ood_result_sha256"] == output["ood_result_sha256"]
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"status": "quality_failed"},
+        {"gate": "different_gate"},
+        {"model_version": "koelectra-dlp-v6"},
+        {"quality_passed": False},
+        {"metrics": None},
+        {"metrics": {"f1": True, "recall": 0.96}},
+        {"metrics": {"f1": 0.95, "recall": 1.01}},
+        {"minimum_f1": True},
+        {"minimum_recall": 0.89},
+        {"metrics": {"f1": 0.89, "recall": 0.96}},
+        {"metrics": {"f1": 0.95, "recall": 0.89}},
+        {"checkpoint_sha256": "b" * 64},
+        {"block_threshold": 0.42},
+        {"review_threshold": 0.19},
+        {"block_threshold": True},
+    ],
+)
+def test_live_pipeline_rejects_unbound_ood_results_before_analysis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    override: dict[str, Any],
+) -> None:
+    state: dict[str, Any] = {}
+    ood_result = _valid_ood_result(**override)
+
+    result, output, _ = _run(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        state,
+        ood_result=ood_result,
+    )
+
+    assert result == 1
+    assert output["error_code"] == "OOD_RESULT_INVALID"
+    assert "ai_request" not in state
+    assert "web_request" not in state

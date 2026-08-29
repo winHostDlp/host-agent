@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -24,13 +25,14 @@ from core_comm.api_client import ApiClient
 from core_comm.event_logger import EventLogger
 from core_comm.local_store import LocalEventStore
 from core_comm.payload_builder import PayloadBuilder
-from scripts.demo_preflight import EXPECTED_MODEL_VERSION, _valid_base_url
+from scripts.demo_preflight import EXPECTED_MODEL_VERSION, _get_json, _valid_base_url
 from scripts.flush_dashboard_logs import _load_settings
 
 
 MARKER_PATTERN_ID = "dlp_test_allow"
-MARKER_TEXT = "SERVER_PIPELINE_R013 >> 확인완료"
+MARKER_TEXT = "SERVER_PIPELINE_R015 >> 확인완료"
 SCOPE = "SERVER_PIPELINE"
+SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
 class PipelineError(Exception):
@@ -76,26 +78,124 @@ def _configured_pipeline(project_root: Path) -> tuple[dict[str, Any], ...]:
         raise PipelineError("AI_CONFIG_INVALID")
     if not _valid_base_url(dashboard_url, require_remote=False) or not dashboard_token:
         raise PipelineError("WEB_CONFIG_INVALID")
-    if bool(viewer_username) != bool(viewer_password):
+    if not viewer_username or not viewer_password:
         raise PipelineError("WEB_CONFIG_INVALID")
-    if viewer_username and viewer_password:
-        try:
-            viewer_username.encode("ascii")
-            viewer_password.encode("ascii")
-        except UnicodeEncodeError as exc:
-            raise PipelineError("WEB_CONFIG_INVALID") from exc
-        if ":" in viewer_username or len(viewer_password) < 16:
-            raise PipelineError("WEB_CONFIG_INVALID")
+    try:
+        viewer_username.encode("ascii")
+        viewer_password.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise PipelineError("WEB_CONFIG_INVALID") from exc
+    if ":" in viewer_username or len(viewer_password) < 16:
+        raise PipelineError("WEB_CONFIG_INVALID")
     return server, agent, logging_cfg, {
         "ai_url": ai_url,
         "ai_token": ai_token,
         "dashboard_url": dashboard_url,
         "dashboard_token": dashboard_token,
-        "viewer_auth": (
-            (viewer_username, viewer_password)
-            if viewer_username and viewer_password
-            else None
-        ),
+        "viewer_auth": (viewer_username, viewer_password),
+    }
+
+
+def _finite_number(value: Any, code: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise PipelineError(code)
+    number = float(value)
+    if not math.isfinite(number):
+        raise PipelineError(code)
+    return number
+
+
+def _read_ai_health(ai_url: str, ai_token: str, timeout: float) -> dict[str, Any]:
+    try:
+        health = _get_json(
+            ai_url.rstrip("/") + "/",
+            timeout,
+            headers={"Authorization": f"Bearer {ai_token}"},
+        )
+    except Exception as exc:
+        raise PipelineError("AI_HEALTH_FAILED") from exc
+
+    checkpoint_sha256 = health.get("checkpoint_sha256")
+    block_threshold = _finite_number(
+        health.get("block_threshold"), "AI_HEALTH_INVALID"
+    )
+    review_threshold = _finite_number(
+        health.get("review_threshold"), "AI_HEALTH_INVALID"
+    )
+    if (
+        health.get("status") != "running"
+        or health.get("engine") != EXPECTED_MODEL_VERSION
+        or health.get("auth_required") is not True
+        or not isinstance(checkpoint_sha256, str)
+        or SHA256_PATTERN.fullmatch(checkpoint_sha256) is None
+        or not 0.0 <= review_threshold < block_threshold <= 1.0
+    ):
+        raise PipelineError("AI_HEALTH_INVALID")
+    return {
+        "checkpoint_sha256": checkpoint_sha256,
+        "block_threshold": block_threshold,
+        "review_threshold": review_threshold,
+    }
+
+
+def _verify_web_health(dashboard_url: str, timeout: float) -> None:
+    try:
+        health = _get_json(dashboard_url.rstrip("/") + "/health", timeout)
+    except Exception as exc:
+        raise PipelineError("WEB_HEALTH_FAILED") from exc
+    if (
+        health.get("status") != "ok"
+        or health.get("database_status") != "ok"
+        or health.get("dashboard_auth_enabled") is not True
+    ):
+        raise PipelineError("WEB_HEALTH_INVALID")
+
+
+def _bind_ood_result(path: Path | None, ai_health: dict[str, Any]) -> dict[str, Any]:
+    if path is None:
+        return {"ood_bound": False, "ood_result_sha256": None}
+    try:
+        raw = path.expanduser().read_bytes()
+        result = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise PipelineError("OOD_RESULT_INVALID") from exc
+    if (
+        not isinstance(result, dict)
+        or result.get("status") != "passed"
+        or result.get("gate") != "blind_ood_final_v1"
+        or result.get("model_version") != EXPECTED_MODEL_VERSION
+        or result.get("quality_passed") is not True
+        or not isinstance(result.get("metrics"), dict)
+    ):
+        raise PipelineError("OOD_RESULT_INVALID")
+    metrics = result["metrics"]
+    block_threshold = _finite_number(
+        result.get("block_threshold"), "OOD_RESULT_INVALID"
+    )
+    review_threshold = _finite_number(
+        result.get("review_threshold"), "OOD_RESULT_INVALID"
+    )
+    f1 = _finite_number(metrics.get("f1"), "OOD_RESULT_INVALID")
+    recall = _finite_number(metrics.get("recall"), "OOD_RESULT_INVALID")
+    minimum_f1 = _finite_number(result.get("minimum_f1"), "OOD_RESULT_INVALID")
+    minimum_recall = _finite_number(
+        result.get("minimum_recall"), "OOD_RESULT_INVALID"
+    )
+    if (
+        result.get("checkpoint_sha256") != ai_health["checkpoint_sha256"]
+        or block_threshold != ai_health["block_threshold"]
+        or review_threshold != ai_health["review_threshold"]
+        or not 0.0 <= f1 <= 1.0
+        or not 0.0 <= recall <= 1.0
+        or not 0.90 <= minimum_f1 <= 1.0
+        or not 0.90 <= minimum_recall <= 1.0
+        or f1 < minimum_f1
+        or recall < minimum_recall
+    ):
+        raise PipelineError("OOD_RESULT_INVALID")
+    return {
+        "ood_bound": True,
+        "ood_result_sha256": hashlib.sha256(raw).hexdigest(),
     }
 
 
@@ -121,7 +221,11 @@ def _marker_hit(project_root: Path, agent: dict[str, Any]) -> dict[str, Any]:
     return hits[0]
 
 
-def _read_single_record(store: LocalEventStore, event_id: str) -> dict[str, Any]:
+def _read_single_record(
+    store: LocalEventStore,
+    event_id: str,
+    runtime_binding: dict[str, Any],
+) -> dict[str, Any]:
     try:
         lines = [
             line
@@ -140,6 +244,7 @@ def _read_single_record(store: LocalEventStore, event_id: str) -> dict[str, Any]
         or extra.get("event_id") != event_id
         or extra.get("model_version") != EXPECTED_MODEL_VERSION
         or extra.get("detection_type") != "HYBRID"
+        or any(extra.get(key) != value for key, value in runtime_binding.items())
         or hit_ids != [MARKER_PATTERN_ID]
     ):
         raise PipelineError("JSONL_INVALID")
@@ -190,9 +295,16 @@ def _read_back(
     return item
 
 
-def _verify(project_root: Path, evidence_root: Path) -> dict[str, Any]:
+def _verify(
+    project_root: Path,
+    evidence_root: Path,
+    ood_result_path: Path | None,
+) -> dict[str, Any]:
     server, agent, logging_cfg, endpoints = _configured_pipeline(project_root)
     timeout = float(server.get("request_timeout_sec", 10))
+    ai_health = _read_ai_health(endpoints["ai_url"], endpoints["ai_token"], timeout)
+    _verify_web_health(endpoints["dashboard_url"], timeout)
+    runtime_binding = {**ai_health, **_bind_ood_result(ood_result_path, ai_health)}
     marker_hit = _marker_hit(project_root, agent)
     builder = PayloadBuilder(
         max_text_chars=agent.get("ai_max_text_chars", 4000),
@@ -205,7 +317,7 @@ def _verify(project_root: Path, evidence_root: Path) -> dict[str, Any]:
         raise PipelineError("AI_CONFIG_INVALID")
 
     event_started = time.perf_counter()
-    payload = builder.build(MARKER_TEXT, [marker_hit], "clipboard", "server-pipeline-r013")
+    payload = builder.build(MARKER_TEXT, [marker_hit], "clipboard", "server-pipeline-r015")
     ai_started = time.perf_counter()
     result = client.analyze(payload)
     ai_rtt_ms = (time.perf_counter() - ai_started) * 1000
@@ -244,14 +356,15 @@ def _verify(project_root: Path, evidence_root: Path) -> dict[str, Any]:
             logger,
             result,
             channel="clipboard",
-            process_name="server-pipeline-r013",
+            process_name="server-pipeline-r015",
             hits=[marker_hit],
             text=MARKER_TEXT,
             event_id=payload.request_id,
             detection_type="HYBRID",
+            metadata=runtime_binding,
         )
         event_to_jsonl_ms = (time.perf_counter() - event_started) * 1000
-        record = _read_single_record(store, payload.request_id)
+        record = _read_single_record(store, payload.request_id, runtime_binding)
         evidence_sha256 = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
         dashboard_payload = logger._build_log_payload_from_record(record)
         if dashboard_payload.get("event_id") != payload.request_id:
@@ -281,6 +394,7 @@ def _verify(project_root: Path, evidence_root: Path) -> dict[str, Any]:
         "windows_hook_e2e": False,
         "event_id": payload.request_id,
         "model_version": result.model_version,
+        **runtime_binding,
         "action": result.action,
         "log_id": stored["log_id"],
         "evidence_path": str(evidence_path.resolve()),
@@ -312,6 +426,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             "Relative paths are resolved from the project root."
         ),
     )
+    parser.add_argument(
+        "--ood-result",
+        type=Path,
+        help=(
+            "Optional blind OOD aggregate JSON. It must pass the evaluator quality "
+            "contract and match the live AI checkpoint and thresholds."
+        ),
+    )
     args = parser.parse_args(argv)
     project_root = args.project_root.resolve()
     evidence_root = args.evidence_root or Path("logs/server-pipeline-evidence")
@@ -319,7 +441,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         evidence_root = project_root / evidence_root
 
     try:
-        output = _verify(project_root, evidence_root)
+        output = _verify(project_root, evidence_root, args.ood_result)
     except PipelineError as exc:
         output = {
             "status": "FAIL",
