@@ -19,11 +19,11 @@ AI 서버 설정 (settings.yaml)
 
 import json
 import logging
+import math
 import os
 import signal
 import sys
 import threading
-import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -89,6 +89,40 @@ def setup_logging(level: str) -> None:
     )
 
 
+def _batch_flush_interval(settings: dict[str, Any]) -> float:
+    """Return the periodic dashboard replay interval; zero disables it."""
+    log_cfg = settings.get("logging", {})
+    if not isinstance(log_cfg, dict):
+        raise ValueError("logging 설정은 mapping이어야 합니다.")
+    raw_interval = log_cfg.get("batch_flush_interval_sec", 0)
+    if isinstance(raw_interval, bool) or not isinstance(raw_interval, (int, float)):
+        raise ValueError(
+            "logging.batch_flush_interval_sec은 0 또는 5 이상의 숫자여야 합니다."
+        )
+    interval = float(raw_interval)
+    if (
+        not math.isfinite(interval)
+        or interval < 0
+        or 0 < interval < 5
+        or interval > threading.TIMEOUT_MAX
+    ):
+        raise ValueError(
+            "logging.batch_flush_interval_sec은 0 또는 5 이상의 지원되는 유한한 숫자여야 합니다."
+        )
+    return interval
+
+
+def _dashboard_delivery_config(settings: dict[str, Any]) -> tuple[str, str]:
+    """Resolve the delivery URL and token used by immediate and batch sends."""
+    server_cfg = settings.get("server", {})
+    dashboard_url = str(server_cfg.get("dashboard_url") or "").strip()
+    dashboard_token = (
+        os.environ.get("AGENT_API_TOKEN", "").strip()
+        or str(server_cfg.get("dashboard_token") or "").strip()
+    )
+    return dashboard_url, dashboard_token
+
+
 # ── 공통 빌더 ──────────────────────────────────────────────────────────────────
 
 def build_api_client(settings: dict[str, Any]) -> ApiClient:
@@ -115,6 +149,8 @@ def build_event_logger(settings: dict[str, Any]) -> EventLogger:
     log_cfg    = settings.get("logging", {})
     server_cfg = settings.get("server", {})
     agent_cfg  = settings.get("agent", {})
+    batch_interval = _batch_flush_interval(settings)
+    dashboard_url, dashboard_token = _dashboard_delivery_config(settings)
 
     store = LocalEventStore(
         log_dir=PROJECT_ROOT / log_cfg.get("log_dir", "logs"),
@@ -122,23 +158,47 @@ def build_event_logger(settings: dict[str, Any]) -> EventLogger:
         text_preview_len=log_cfg.get("text_preview_len", 120),
     )
     send_now = bool(log_cfg.get("send_immediately", False))
-    dashboard_url = server_cfg.get("dashboard_url") if send_now else None
+    delivery_requested = send_now or batch_interval > 0
+    configured_dashboard_url = (
+        dashboard_url if delivery_requested and dashboard_url and dashboard_token else None
+    )
 
     user_id = agent_cfg.get("user_id") or os.environ.get("USERNAME", "")
 
     return EventLogger(
         store=store,
-        dashboard_url=dashboard_url,
-        dashboard_token=(
-            os.environ.get("AGENT_API_TOKEN")
-            or server_cfg.get("dashboard_token", "")
-        ),
+        dashboard_url=configured_dashboard_url,
+        dashboard_token=dashboard_token,
         timeout=server_cfg.get("request_timeout_sec", 10),
         send_immediately=send_now,
         agent_id=agent_cfg.get("agent_id", ""),
         user_id=user_id,
         department=agent_cfg.get("department", "Unknown"),
     )
+
+
+def _run_batch_replay(
+    event_logger: EventLogger,
+    stop_event: "threading.Event",
+    interval: float,
+) -> None:
+    """Replay local events at startup and periodically until Agent shutdown."""
+    logger = logging.getLogger(__name__)
+    while not stop_event.is_set():
+        try:
+            event_logger.flush_to_server(stop_event=stop_event)
+        except Exception as exc:
+            # A replay failure must never terminate detection channels. The next
+            # interval retries the same local-first JSONL records.
+            logger.warning(
+                "대시보드 배치 재전송 실패(다음 주기 재시도): %s",
+                type(exc).__name__,
+            )
+
+        # ponytail: every pass rescans JSONL history. Replace this with a durable
+        # outbox cursor only when one pass approaches the configured interval.
+        if stop_event.wait(interval):
+            return
 
 
 def make_block_handler(
@@ -526,6 +586,8 @@ def run(mode: str = "all", stop_event: Optional["threading.Event"] = None) -> No
     import threading as _threading
 
     settings = load_settings()
+    batch_interval = _batch_flush_interval(settings)
+    dashboard_url, dashboard_token = _dashboard_delivery_config(settings)
     setup_logging(settings.get("agent", {}).get("log_level", "INFO"))
     logger = logging.getLogger(__name__)
     logger.info("Sentry Host Agent 시작 — mode=%s", mode)
@@ -552,10 +614,39 @@ def run(mode: str = "all", stop_event: Optional["threading.Event"] = None) -> No
         active,
     )
 
+    lifecycle_stop = stop_event or _threading.Event()
+    batch_thread: Optional["threading.Thread"] = None
+    if batch_interval > 0 and dashboard_url and dashboard_token and not lifecycle_stop.is_set():
+        batch_thread = _threading.Thread(
+            target=_run_batch_replay,
+            args=(event_logger, lifecycle_stop, batch_interval),
+            daemon=True,
+            name="DashboardBatchReplay",
+        )
+        batch_thread.start()
+        logger.info("대시보드 배치 재전송 ON (startup + %.0f초 주기)", batch_interval)
+    elif batch_interval > 0:
+        logger.warning(
+            "대시보드 배치 재전송 OFF (dashboard_url과 dashboard_token이 모두 필요함)"
+        )
+
     logger.info("Sentry Host Agent running. Press Ctrl+C to stop.")
 
+    shutdown_started = False
+
     def _shutdown() -> None:
+        nonlocal shutdown_started
+        if shutdown_started:
+            return
+        shutdown_started = True
         logger.info("종료 중...")
+        lifecycle_stop.set()
+        if batch_thread is not None and batch_thread.is_alive():
+            batch_thread.join(timeout=1.0)
+            if batch_thread.is_alive():
+                logger.warning(
+                    "배치 재전송을 1초 내에 종료하지 못해 daemon으로 남깁니다."
+                )
         for ch in reversed(active):
             try:
                 ch.stop()
@@ -576,13 +667,10 @@ def run(mode: str = "all", stop_event: Optional["threading.Event"] = None) -> No
         logger.debug("메인 스레드가 아니므로 OS signal handler 등록 생략")
 
     try:
-        if stop_event is not None:
-            # 서비스 모드: stop_event가 set될 때까지 대기
-            while not stop_event.wait(timeout=1):
-                pass
-        else:
-            while True:
-                time.sleep(1)
+        # 서비스는 외부 stop_event, 직접 실행은 내부 event를
+        # 배치 worker와 공유해 종료 신호를 하나로 유지한다.
+        while not lifecycle_stop.wait(timeout=1):
+            pass
     except KeyboardInterrupt:
         pass
     finally:

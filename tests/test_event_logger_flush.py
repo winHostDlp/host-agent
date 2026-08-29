@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from typing import Any
 from unittest.mock import Mock
 
@@ -62,6 +63,92 @@ def test_flush_counts_all_successful_posts(tmp_path: Any, monkeypatch: pytest.Mo
     )
 
     assert event_logger.flush_to_server() == 3
+
+
+def test_failed_immediate_send_replays_persisted_id_and_accepts_duplicate_receipt(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalEventStore(tmp_path)
+    event_logger = EventLogger(
+        store=store,
+        dashboard_url="https://dashboard.test",
+        send_immediately=True,
+    )
+    posted: list[dict[str, Any]] = []
+    original_extra = {"reason": "stable delivery id"}
+    responses = iter(
+        [
+            _Response(RuntimeError("offline")),
+            _Response(RuntimeError("offline")),
+            _Response(RuntimeError("offline")),
+            _Response(
+                body={
+                    "event_id": "filled-after-local-write",
+                    "log_id": 7,
+                    "duplicate": True,
+                }
+            ),
+        ]
+    )
+
+    class ImmediateThread:
+        def __init__(self, *, target: Any, args: tuple[Any, ...], **_: Any) -> None:
+            self._target = target
+            self._args = args
+
+        def start(self) -> None:
+            self._target(*self._args)
+
+    monkeypatch.setattr("core_comm.event_logger.threading.Thread", ImmediateThread)
+    monkeypatch.setattr("core_comm.event_logger.sleep", lambda _delay: None)
+
+    def post_in_sequence(*args: Any, **kwargs: Any) -> _Response:
+        posted.append(kwargs["json"])
+        response = next(responses)
+        if response._body is not None:
+            response._body["event_id"] = kwargs["json"]["event_id"]
+        return response
+
+    monkeypatch.setattr(
+        "core_comm.event_logger.requests.post",
+        post_in_sequence,
+    )
+
+    event_logger.log(
+        channel="clipboard",
+        action="allowed",
+        process_name="chrome.exe",
+        hits=[],
+        extra=original_extra,
+    )
+
+    record = json.loads(store._active_path.read_text(encoding="utf-8"))
+    persisted_event_id = record["extra"]["event_id"]
+    assert len(posted) == 3
+    assert {payload["event_id"] for payload in posted} == {persisted_event_id}
+    assert event_logger.flush_to_server() == 1
+    assert posted[-1]["event_id"] == persisted_event_id
+    assert "event_id" not in original_extra
+
+
+def test_flush_stops_between_records_when_agent_is_stopping(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event_logger = _logger_with_records(tmp_path, count=3)
+    stop_event = threading.Event()
+    posted: list[dict[str, Any]] = []
+
+    def post_once(*args: Any, **kwargs: Any) -> _Response:
+        posted.append(kwargs["json"])
+        stop_event.set()
+        return _accepted_response(*args, **kwargs)
+
+    monkeypatch.setattr("core_comm.event_logger.requests.post", post_once)
+
+    assert event_logger.flush_to_server(stop_event=stop_event) == 1
+    assert len(posted) == 1
 
 
 def test_flush_replays_rotated_and_active_logs(

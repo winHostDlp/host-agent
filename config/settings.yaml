@@ -38,3 +38,5 @@ logging:
 
   # 웹 대시보드 전송 설정
   send_immediately: true    # 탐지 즉시 POST /api/v1/logs 로 전송
+  # 시작 직후와 설정 주기마다 로컬 JSONL을 재전송. 0이면 비활성화
+  batch_flush_interval_sec: 60

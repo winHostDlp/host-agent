@@ -529,6 +529,181 @@ def test_main_agent_merges_ignored_local_settings_and_prefers_env_token(
     assert captured["token"] == "environment-token-32-bytes-minimum"
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(0, 0.0), (5, 5.0), (60.5, 60.5)],
+)
+def test_batch_flush_interval_accepts_zero_or_at_least_five_seconds(
+    monkeypatch,
+    value,
+    expected,
+):
+    main_agent = _load_main_agent_without_windows_modules(monkeypatch)
+
+    assert main_agent._batch_flush_interval(
+        {"logging": {"batch_flush_interval_sec": value}}
+    ) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        True,
+        False,
+        -1,
+        1,
+        float("nan"),
+        float("inf"),
+        threading.TIMEOUT_MAX + 1,
+        "60",
+        None,
+    ],
+)
+def test_batch_flush_interval_rejects_invalid_values(monkeypatch, value):
+    main_agent = _load_main_agent_without_windows_modules(monkeypatch)
+
+    with pytest.raises(ValueError, match="batch_flush_interval_sec"):
+        main_agent._batch_flush_interval(
+            {"logging": {"batch_flush_interval_sec": value}}
+        )
+
+
+def test_batch_flush_interval_rejects_non_mapping_logging(monkeypatch):
+    main_agent = _load_main_agent_without_windows_modules(monkeypatch)
+
+    with pytest.raises(ValueError, match="logging"):
+        main_agent._batch_flush_interval({"logging": []})
+
+
+def test_batch_delivery_requires_both_dashboard_url_and_token(
+    tmp_path,
+    monkeypatch,
+):
+    main_agent = _load_main_agent_without_windows_modules(monkeypatch)
+    monkeypatch.setattr(main_agent, "PROJECT_ROOT", tmp_path)
+    monkeypatch.delenv("AGENT_API_TOKEN", raising=False)
+    captured = []
+
+    class CapturingEventLogger:
+        def __init__(self, **kwargs):
+            captured.append(kwargs)
+
+    monkeypatch.setattr(main_agent, "EventLogger", CapturingEventLogger)
+    base = {
+        "agent": {},
+        "logging": {
+            "log_dir": "logs",
+            "send_immediately": False,
+            "batch_flush_interval_sec": 60,
+        },
+        "server": {
+            "dashboard_url": "https://dashboard.test",
+            "dashboard_token": "agent-token",
+        },
+    }
+
+    main_agent.build_event_logger(base)
+    assert captured[-1]["dashboard_url"] == "https://dashboard.test"
+    assert captured[-1]["send_immediately"] is False
+
+    base["server"]["dashboard_token"] = ""
+    main_agent.build_event_logger(base)
+    assert captured[-1]["dashboard_url"] is None
+
+
+def test_batch_replay_starts_immediately_and_retries_after_failure(
+    monkeypatch,
+    caplog,
+):
+    main_agent = _load_main_agent_without_windows_modules(monkeypatch)
+    event_logger = Mock()
+    event_logger.flush_to_server.side_effect = [RuntimeError("offline"), 2]
+
+    class TwoCycleStop:
+        def __init__(self):
+            self.stopped = False
+            self.waits = []
+
+        def is_set(self):
+            return self.stopped
+
+        def wait(self, timeout):
+            self.waits.append(timeout)
+            if len(self.waits) == 2:
+                self.stopped = True
+                return True
+            return False
+
+    stop_event = TwoCycleStop()
+    with caplog.at_level("WARNING"):
+        main_agent._run_batch_replay(event_logger, stop_event, 60)
+
+    assert event_logger.flush_to_server.call_count == 2
+    assert all(
+        call.kwargs == {"stop_event": stop_event}
+        for call in event_logger.flush_to_server.call_args_list
+    )
+    assert stop_event.waits == [60, 60]
+    assert "RuntimeError" in caplog.text
+
+
+def test_run_uses_shared_stop_event_and_bounded_batch_join(monkeypatch):
+    main_agent = _load_main_agent_without_windows_modules(monkeypatch)
+    settings = {
+        "agent": {},
+        "logging": {"batch_flush_interval_sec": 60},
+        "server": {
+            "dashboard_url": "https://dashboard.test",
+            "dashboard_token": "agent-token",
+        },
+    }
+    monkeypatch.setattr(main_agent, "load_settings", lambda: settings)
+    monkeypatch.setattr(main_agent, "load_channel_policy", lambda: {})
+    monkeypatch.setattr(main_agent, "setup_logging", lambda level: None)
+    monkeypatch.setattr(main_agent, "RuleFilter", lambda path: object())
+    monkeypatch.setattr(main_agent, "build_event_logger", lambda current: Mock())
+    monkeypatch.setattr(
+        main_agent,
+        "build_api_client",
+        lambda current: type("Api", (), {"is_mock": True})(),
+    )
+    monkeypatch.setattr(main_agent, "build_payload_builder", lambda current: object())
+    monkeypatch.setattr(main_agent, "FileInspector", lambda: object())
+    active_channel = Mock()
+    monkeypatch.setattr(
+        main_agent,
+        "_start_channels",
+        lambda *args: args[-1].append(active_channel),
+    )
+    monkeypatch.setattr(main_agent.signal, "signal", Mock())
+
+    stop_event = threading.Event()
+    thread_state = {}
+
+    class BoundedThread:
+        def __init__(self, **kwargs):
+            thread_state.update(kwargs)
+
+        def start(self):
+            stop_event.set()
+
+        def is_alive(self):
+            return True
+
+        def join(self, timeout=None):
+            thread_state["join_timeout"] = timeout
+
+    monkeypatch.setattr(main_agent.threading, "Thread", BoundedThread)
+
+    main_agent.run(mode="system", stop_event=stop_event)
+
+    assert thread_state["name"] == "DashboardBatchReplay"
+    assert thread_state["daemon"] is True
+    assert thread_state["args"][1] is stop_event
+    assert thread_state["join_timeout"] == 1.0
+    active_channel.stop.assert_called_once_with()
+
+
 def test_runtime_identity_checks_bind_task_and_listener_to_current_project(
     monkeypatch,
 ):

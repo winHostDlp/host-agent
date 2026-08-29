@@ -174,17 +174,22 @@ class EventLogger:
         # 잘못된 provenance가 JSONL에 영구히 남아 flush마다 실패하지 않게
         # 로컬 파일을 쓰기 전에 검증한다.
         _map_event_provenance(channel, action)
+        event_extra = dict(extra or {})
+        if not event_extra.get("event_id"):
+            event_extra["event_id"] = str(uuid.uuid4())
         self._store.write(
             channel=channel,
             action=action,
             process_name=process_name,
             hits=hits,
             text=text,
-            extra=extra,
+            extra=event_extra,
         )
 
         if self._send_immediately:
-            payload = self._build_log_payload(channel, action, process_name, hits, text, extra)
+            payload = self._build_log_payload(
+                channel, action, process_name, hits, text, event_extra
+            )
             threading.Thread(
                 target=self._post_immediately,
                 args=(payload,),
@@ -192,7 +197,10 @@ class EventLogger:
                 name="EventSender",
             ).start()
 
-    def flush_to_server(self) -> int:
+    def flush_to_server(
+        self,
+        stop_event: Optional[threading.Event] = None,
+    ) -> int:
         """로컬 JSONL의 모든 레코드를 웹 서버로 POST하고 성공 건수를 반환한다.
 
         서버가 준비된 뒤 호출하면 미전송 이벤트를 일괄 전송한다.
@@ -208,8 +216,12 @@ class EventLogger:
 
         sent = 0
         for log_path in log_paths:
+            if stop_event is not None and stop_event.is_set():
+                break
             with log_path.open("r", encoding="utf-8") as f:
                 for line in f:
+                    if stop_event is not None and stop_event.is_set():
+                        break
                     line = line.strip()
                     if not line:
                         continue

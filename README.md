@@ -65,6 +65,10 @@ server:
   ai_token: "<AI_API_TOKEN>"
   dashboard_url: "http://<WEB_LAN_IP>:8000"
   dashboard_token: "<AGENT_API_TOKEN>"
+
+logging:
+  send_immediately: true
+  batch_flush_interval_sec: 60
 ```
 
 토큰 실값은 추적되는 `config/settings.yaml`·Git·문서·발표 화면에 남기지 않습니다. `settings.local.yaml`은 각 시연 PC에서만 만들며 공유할 때도 보안 채널을 사용합니다.
@@ -121,7 +125,9 @@ JSONL 증거는 기본 `logs/server-pipeline-evidence/YYYY-MM-DD/<event_id>/even
 
 출력의 `scope=SERVER_PIPELINE`, `windows_hook_e2e=false`가 범위입니다. `ood_bound=true`도 해당 서버의 품질 결과와 연결됐다는 뜻일 뿐 Windows 훅 검증으로 범위를 넓히지 않습니다. 이 검사는 macOS에서도 서버 공통 경로를 검증할 수 있지만 Clipboard·USB·Outlook·WebProxy 등 Windows 훅과 실제 사용자 조치를 시험하지 않습니다. 따라서 5개 발표 채널의 Windows Host→AI→Web E2E 증거로 대체하면 안 됩니다.
 
-실시간 대시보드 전송은 채널 조치를 막지 않는 백그라운드 작업에서 최대 3회 짧게 재시도합니다. 모두 실패한 이벤트는 자동 재전송되지 않고 로컬 JSONL에만 남습니다. 네트워크 복구 후 다음 명령으로 활성·회전 로컬 로그(`events*.jsonl`)를 명시적으로 재전송하고, `attempted`와 `successful_posts`가 같은지 확인하세요. `successful_posts`는 Web 저장 응답의 동일한 `event_id`, 양의 `log_id`, boolean `duplicate`까지 검증한 건수입니다. Web은 안정적인 `event_id`를 중복 저장하지 않습니다.
+실시간 대시보드 전송은 채널 조치를 막지 않는 백그라운드 작업에서 최대 3회 짧게 재시도합니다. 모두 실패해도 이벤트는 먼저 기록된 로컬 JSONL에 남으며, Agent는 시작 직후와 `logging.batch_flush_interval_sec` 주기마다 활성·회전 로그(`events*.jsonl`)를 자동 재전송합니다. 주기는 `0`으로 비활성화하거나 5초 이상의 유한한 숫자로 설정하며, 다른 값은 Agent를 시작하지 않고 설정 오류로 처리합니다. `dashboard_url`과 `dashboard_token`이 모두 있을 때만 주기 재전송을 시작하며, 재전송 실패는 채널 감시·판정·로컬 저장을 중단하지 않습니다.
+
+자동 재전송은 로컬 감사 로그를 삭제·수정하지 않고 매번 전체 이력을 읽습니다. user/system 두 프로세스를 동시 운영하면 같은 로컬 로그를 둘 다 재전송할 수 있지만, Web이 안정적인 `event_id`를 중복 저장하지 않아 행이 중복되지는 않습니다. `successful_posts`는 Web 영수증의 동일한 `event_id`, 양의 `log_id`, boolean `duplicate`까지 검증한 건수입니다. 이 구조는 영속 cursor나 fleet 전송 큐가 아닙니다. 로그 양이 커져 한 번의 전체 순회가 설정 주기에 근접하면 그때 영속 cursor/outbox로 전환해야 합니다. 즉시 수동 확인은 아래 명령을 계속 사용할 수 있습니다.
 
 신규로 생성되는 `logs/events*.jsonl`은 검사 원문과 `text_preview`를 저장하지 않고 `text_sha256`만 기록합니다. 호환성을 위해 `logging.text_preview_len` 설정은 계속 받지만 신규 로그 내용에는 영향을 주지 않습니다. 이전 버전이 생성한 JSONL에는 원문 미리보기가 남아 있을 수 있으며, 이런 기존 로그도 재전송은 가능하지만 자동 수정·삭제되지 않습니다. 로그는 계속 Git에서 제외하고, 시연에는 가상 데이터만 사용하세요.
 
