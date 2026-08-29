@@ -34,6 +34,8 @@ class LocalEventStore:
     ) -> None:
         self._log_dir = log_dir
         self._max_bytes = max_bytes
+        # 기존 설정·생성자 호출 호환용 no-op. 신규 로그에는 원문 preview를
+        # 저장하지 않는다.
         self._preview_len = text_preview_len
         self._lock = threading.Lock()
 
@@ -64,7 +66,7 @@ class LocalEventStore:
         hits:
             rule_filter가 반환한 정규식 매칭 목록.
         text:
-            검사한 원본 텍스트 (저장 시 앞 N자 preview + SHA-256만 기록).
+            검사한 원본 텍스트 (내용은 저장하지 않고 SHA-256만 기록).
         extra:
             채널별 추가 정보 (파일 경로, 수신자 주소 등).
         """
@@ -112,7 +114,6 @@ class LocalEventStore:
         }
 
         if text:
-            record["text_preview"] = text[: self._preview_len]
             record["text_sha256"] = hashlib.sha256(text.encode()).hexdigest()
 
         if extra:

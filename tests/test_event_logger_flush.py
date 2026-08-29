@@ -142,22 +142,34 @@ def test_flush_preserves_original_event_timestamp(
     assert posted[0]["timestamp"] == original["timestamp"]
 
 
-def test_legacy_record_without_event_id_replays_with_stable_id(
+def test_legacy_record_with_preview_replays_with_stable_id(
     tmp_path: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = LocalEventStore(tmp_path)
-    store.write(
-        channel="clipboard",
-        action="allowed",
-        process_name="legacy.exe",
-        hits=[],
+    legacy_preview = "주민등록번호 900101-1234567"
+    store._active_path.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-08-29T00:00:00+00:00",
+                "hostname": "legacy-host",
+                "channel": "clipboard",
+                "action": "allowed",
+                "process": "legacy.exe",
+                "hits": [],
+                "text_preview": legacy_preview,
+                "text_sha256": "legacy-hash",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
     )
-    posted: list[str] = []
+    posted: list[dict[str, Any]] = []
     monkeypatch.setattr(
         "core_comm.event_logger.requests.post",
         lambda *args, **kwargs: (
-            posted.append(kwargs["json"]["event_id"])
+            posted.append(kwargs["json"])
             or _accepted_response(*args, **kwargs)
         ),
     )
@@ -166,7 +178,8 @@ def test_legacy_record_without_event_id_replays_with_stable_id(
     assert event_logger.flush_to_server() == 1
     assert event_logger.flush_to_server() == 1
     assert len(posted) == 2
-    assert posted[0] == posted[1]
+    assert posted[0]["event_id"] == posted[1]["event_id"]
+    assert all(legacy_preview not in json.dumps(item, ensure_ascii=False) for item in posted)
 
 
 @pytest.mark.parametrize(

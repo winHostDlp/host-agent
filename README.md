@@ -115,7 +115,7 @@ JSONL 증거는 기본 `logs/server-pipeline-evidence/YYYY-MM-DD/<event_id>/even
 
 실시간 대시보드 전송은 채널 조치를 막지 않는 백그라운드 작업에서 최대 3회 짧게 재시도합니다. 모두 실패한 이벤트는 자동 재전송되지 않고 로컬 JSONL에만 남습니다. 네트워크 복구 후 다음 명령으로 활성·회전 로컬 로그(`events*.jsonl`)를 명시적으로 재전송하고, `attempted`와 `successful_posts`가 같은지 확인하세요. `successful_posts`는 Web 저장 응답의 동일한 `event_id`, 양의 `log_id`, boolean `duplicate`까지 검증한 건수입니다. Web은 안정적인 `event_id`를 중복 저장하지 않습니다.
 
-`logs/events*.jsonl`에는 탐지 근거 미리보기가 포함될 수 있어 Git에서 제외합니다. 시연에는 가상 데이터만 사용하고, 공유·발표 전 로그 디렉터리를 확인하세요.
+신규로 생성되는 `logs/events*.jsonl`은 검사 원문과 `text_preview`를 저장하지 않고 `text_sha256`만 기록합니다. 호환성을 위해 `logging.text_preview_len` 설정은 계속 받지만 신규 로그 내용에는 영향을 주지 않습니다. 이전 버전이 생성한 JSONL에는 원문 미리보기가 남아 있을 수 있으며, 이런 기존 로그도 재전송은 가능하지만 자동 수정·삭제되지 않습니다. 로그는 계속 Git에서 제외하고, 시연에는 가상 데이터만 사용하세요.
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\flush_dashboard_logs.py

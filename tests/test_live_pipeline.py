@@ -245,9 +245,15 @@ def test_live_pipeline_uses_real_http_headers_and_one_event_id(
     assert evidence_path.name == "events.jsonl"
     assert evidence_path.exists()
     assert output["evidence_sha256"] == hashlib.sha256(evidence_path.read_bytes()).hexdigest()
-    assert json.loads(evidence_path.read_text(encoding="utf-8"))["extra"]["event_id"] == (
-        output["event_id"]
-    )
+    evidence_text = evidence_path.read_text(encoding="utf-8")
+    assert verify_live_pipeline.MARKER_TEXT not in evidence_text
+    evidence_record = json.loads(evidence_text)
+    assert "text_preview" not in evidence_record
+    assert evidence_record["text_sha256"] == hashlib.sha256(
+        verify_live_pipeline.MARKER_TEXT.encode()
+    ).hexdigest()
+    assert evidence_record["hits"][0]["id"] == verify_live_pipeline.MARKER_PATTERN_ID
+    assert evidence_record["extra"]["event_id"] == output["event_id"]
 
 
 @pytest.mark.parametrize(
