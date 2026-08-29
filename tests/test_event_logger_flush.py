@@ -14,12 +14,32 @@ from scripts import flush_dashboard_logs
 class _Response:
     status_code = 201
 
-    def __init__(self, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        error: Exception | None = None,
+        body: dict[str, Any] | None = None,
+    ) -> None:
         self._error = error
+        self._body = body
 
     def raise_for_status(self) -> None:
         if self._error is not None:
             raise self._error
+
+    def json(self) -> dict[str, Any] | None:
+        return self._body
+
+
+def _accepted_response(
+    *args: Any,
+    error: Exception | None = None,
+    **kwargs: Any,
+) -> _Response:
+    payload = kwargs["json"]
+    return _Response(
+        error=error,
+        body={"event_id": payload["event_id"], "log_id": 1, "duplicate": False},
+    )
 
 
 def _logger_with_records(tmp_path: Any, count: int) -> EventLogger:
@@ -38,7 +58,7 @@ def test_flush_counts_all_successful_posts(tmp_path: Any, monkeypatch: pytest.Mo
     event_logger = _logger_with_records(tmp_path, count=3)
     monkeypatch.setattr(
         "core_comm.event_logger.requests.post",
-        lambda *args, **kwargs: _Response(),
+        _accepted_response,
     )
 
     assert event_logger.flush_to_server() == 3
@@ -55,7 +75,9 @@ def test_flush_replays_rotated_and_active_logs(
     posted = []
     monkeypatch.setattr(
         "core_comm.event_logger.requests.post",
-        lambda *args, **kwargs: posted.append(kwargs["json"]) or _Response(),
+        lambda *args, **kwargs: (
+            posted.append(kwargs["json"]) or _accepted_response(*args, **kwargs)
+        ),
     )
 
     event_logger = EventLogger(store=store, dashboard_url="https://dashboard.test")
@@ -79,17 +101,16 @@ def test_flush_counts_only_successful_posts_in_mixed_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     event_logger = _logger_with_records(tmp_path, count=4)
-    responses = iter(
-        [
-            _Response(),
-            _Response(RuntimeError("server unavailable")),
-            _Response(),
-            _Response(RuntimeError("server unavailable")),
-        ]
+    errors = iter(
+        [None, RuntimeError("server unavailable"), None, RuntimeError("server unavailable")]
     )
     monkeypatch.setattr(
         "core_comm.event_logger.requests.post",
-        lambda *args, **kwargs: next(responses),
+        lambda *args, **kwargs: _accepted_response(
+            *args,
+            error=next(errors),
+            **kwargs,
+        ),
     )
 
     assert event_logger.flush_to_server() == 2
@@ -112,7 +133,7 @@ def test_flush_preserves_original_event_timestamp(
 
     def capture_post(*args: Any, **kwargs: Any) -> _Response:
         posted.append(kwargs["json"])
-        return _Response()
+        return _accepted_response(*args, **kwargs)
 
     monkeypatch.setattr("core_comm.event_logger.requests.post", capture_post)
     event_logger = EventLogger(store=store, dashboard_url="https://dashboard.test")
@@ -135,7 +156,10 @@ def test_legacy_record_without_event_id_replays_with_stable_id(
     posted: list[str] = []
     monkeypatch.setattr(
         "core_comm.event_logger.requests.post",
-        lambda *args, **kwargs: posted.append(kwargs["json"]["event_id"]) or _Response(),
+        lambda *args, **kwargs: (
+            posted.append(kwargs["json"]["event_id"])
+            or _accepted_response(*args, **kwargs)
+        ),
     )
     event_logger = EventLogger(store=store, dashboard_url="https://dashboard.test")
 
@@ -143,6 +167,43 @@ def test_legacy_record_without_event_id_replays_with_stable_id(
     assert event_logger.flush_to_server() == 1
     assert len(posted) == 2
     assert posted[0] == posted[1]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        None,
+        {"event_id": "different", "log_id": 1, "duplicate": False},
+        {"event_id": "receipt-event", "log_id": None, "duplicate": False},
+        {"event_id": "receipt-event", "log_id": 1, "duplicate": "false"},
+    ],
+)
+def test_post_rejects_invalid_dashboard_receipt(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    body: dict[str, Any] | None,
+) -> None:
+    event_logger = _logger_with_records(tmp_path, count=0)
+    monkeypatch.setattr(
+        "core_comm.event_logger.requests.post",
+        lambda *args, **kwargs: _Response(body=body),
+    )
+
+    assert event_logger._post({"event_id": "receipt-event"}) is False
+
+
+def test_post_logs_valid_dashboard_receipt(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    event_logger = _logger_with_records(tmp_path, count=0)
+    monkeypatch.setattr("core_comm.event_logger.requests.post", _accepted_response)
+
+    with caplog.at_level("INFO", logger="core_comm.event_logger"):
+        assert event_logger._post({"event_id": "receipt-event"}) is True
+
+    assert "event_id=receipt-event log_id=1 duplicate=False" in caplog.text
 
 
 def test_immediate_post_retries_until_success(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -204,7 +265,11 @@ logging:
     )
     monkeypatch.setattr(
         "core_comm.event_logger.requests.post",
-        lambda *args, **kwargs: _Response(post_error),
+        lambda *args, **kwargs: _accepted_response(
+            *args,
+            error=post_error,
+            **kwargs,
+        ),
     )
 
     assert flush_dashboard_logs.main(["--project-root", str(tmp_path)]) == expected_exit

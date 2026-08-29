@@ -326,9 +326,22 @@ class EventLogger:
         try:
             resp = requests.post(url, json=payload, headers=headers, timeout=self._timeout)
             resp.raise_for_status()
-            logger.debug(
-                "Event posted → %s (%d) event_id=%s",
-                url, resp.status_code, payload.get("event_id"),
+            receipt = resp.json()
+            expected_event_id = payload.get("event_id")
+            if not isinstance(receipt, dict) or receipt.get("event_id") != expected_event_id:
+                raise ValueError("Web 저장 응답의 event_id가 요청과 다릅니다.")
+            log_id = receipt.get("log_id")
+            duplicate = receipt.get("duplicate")
+            if (
+                not isinstance(log_id, int)
+                or isinstance(log_id, bool)
+                or log_id < 1
+                or not isinstance(duplicate, bool)
+            ):
+                raise ValueError("Web 저장 응답의 log_id 또는 duplicate 형식이 잘못되었습니다.")
+            logger.info(
+                "Event stored → %s (%d) event_id=%s log_id=%d duplicate=%s",
+                url, resp.status_code, expected_event_id, log_id, duplicate,
             )
             return True
         except Exception as exc:
