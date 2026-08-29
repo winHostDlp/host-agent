@@ -47,14 +47,17 @@ def record_analysis_result(
         raise ValueError(f"지원하지 않는 AI action: {result.action!r}") from exc
 
     extra = dict(metadata or {})
+    effective_detection_type = (
+        "RULE_BASED" if result.analysis_failed else detection_type
+    )
     extra.update(
         {
             "event_id": event_id or result.request_id or None,
             "ai_score": result.confidence_score,
             "reason": result.reason,
             "model_version": result.model_version,
-            "latency_ms": int(result.latency_ms),
-            "detection_type": detection_type,
+            "latency_ms": round(result.latency_ms),
+            "detection_type": effective_detection_type,
         }
     )
     event_logger.log(

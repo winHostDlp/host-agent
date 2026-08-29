@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib.util
 import ipaddress
 import json
-import socket
+import os
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -19,6 +19,7 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_MODEL_VERSION = "koelectra-dlp-v7"
+DEFAULT_DASHBOARD_TOKEN = "sentry-agent-demo-token"
 STRUCTURED_FILE_MODULES = {
     "DOCX": "docx",
     "PDF": "fitz",
@@ -29,8 +30,6 @@ STRUCTURED_FILE_MODULES = {
 }
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
-from core_comm.drive_baseline import LOCAL_BASELINE_PATH, load_internal_drives
 
 
 @dataclass(frozen=True)
@@ -142,21 +141,54 @@ def _powershell_boolean(script: str, timeout: float = 5.0) -> bool:
         return False
 
 
+def _ps_literal(value: str) -> str:
+    """Return a PowerShell single-quoted literal for a trusted local path."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _expected_user_agent_paths() -> tuple[Path, Path, Path]:
+    pythonw = Path(sys.executable).resolve().with_name("pythonw.exe")
+    script = (PROJECT_ROOT / "sentry_user_agent.py").resolve()
+    return pythonw, script, PROJECT_ROOT.resolve()
+
+
 def _user_agent_task_running() -> bool:
-    return _powershell_boolean(
+    pythonw, script, working_directory = _expected_user_agent_paths()
+    ps = (
         "$task = Get-ScheduledTask -TaskName 'SentryUserAgent' -ErrorAction Stop; "
-        "Write-Output ([bool]($task.State -eq 'Running'))"
+        "$action = @($task.Actions)[0]; "
+        "$currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name; "
+        "$actualArgs = ([string]$action.Arguments).Trim().Trim([char]34); "
+        f"$expectedExe = {_ps_literal(str(pythonw))}; "
+        f"$expectedScript = {_ps_literal(str(script))}; "
+        f"$expectedDir = {_ps_literal(str(working_directory))}; "
+        "$ok = ($task.State -eq 'Running') -and "
+        "($task.Principal.UserId -ieq $currentUser) -and "
+        "([string]$action.Execute -ieq $expectedExe) -and "
+        "($actualArgs -ieq $expectedScript) -and "
+        "([string]$action.WorkingDirectory -ieq $expectedDir); "
+        "Write-Output ([bool]$ok)"
     )
+    return _powershell_boolean(ps)
 
 
 def _proxy_listener_running(port: int) -> bool:
     if not 1 <= port <= 65535:
         return False
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=0.75):
-            return True
-    except OSError:
-        return False
+    pythonw, script, _ = _expected_user_agent_paths()
+    ps = (
+        f"$expectedExe = {_ps_literal(str(pythonw))}; "
+        f"$expectedScript = {_ps_literal(str(script))}; "
+        "$connections = @(Get-NetTCPConnection -LocalAddress '127.0.0.1' "
+        f"-LocalPort {port} -State Listen -ErrorAction Stop); "
+        "$ok = $false; foreach ($connection in $connections) { "
+        "$process = Get-CimInstance Win32_Process "
+        "-Filter ('ProcessId = ' + $connection.OwningProcess) -ErrorAction SilentlyContinue; "
+        "if ($process -and ([string]$process.ExecutablePath -ieq $expectedExe) -and "
+        "([string]$process.CommandLine).Contains($expectedScript)) { $ok = $true } }; "
+        "Write-Output ([bool]$ok)"
+    )
+    return _powershell_boolean(ps)
 
 
 def _quic_firewall_rule_active() -> bool:
@@ -183,6 +215,32 @@ def _section(mapping: dict[str, Any], name: str) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _merge_settings(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_settings(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _load_settings(project_root: Path) -> dict[str, Any]:
+    settings = yaml.safe_load(
+        (project_root / "config" / "settings.yaml").read_text(encoding="utf-8")
+    )
+    if not isinstance(settings, dict):
+        raise ValueError("settings.yaml은 mapping이어야 합니다")
+
+    local_path = project_root / "config" / "settings.local.yaml"
+    if local_path.exists():
+        local_settings = yaml.safe_load(local_path.read_text(encoding="utf-8"))
+        if not isinstance(local_settings, dict):
+            raise ValueError("settings.local.yaml은 mapping이어야 합니다")
+        settings = _merge_settings(settings, local_settings)
+    return settings
+
+
 def _channel_check(name: str, requirements: list[tuple[bool, str]]) -> Check:
     missing = [label for ready, label in requirements if not ready]
     return Check(
@@ -196,14 +254,10 @@ def collect_checks(project_root: Path = PROJECT_ROOT) -> list[Check]:
     """Inspect configuration and runtime prerequisites without changing them."""
     scenario_names = ["CLIPBOARD", "USB_COPY", "EMAIL_ATTACHMENT", "WEB_UPLOAD", "CLOUD_DRIVE"]
     try:
-        settings = yaml.safe_load(
-            (project_root / "config" / "settings.yaml").read_text(encoding="utf-8")
-        )
+        settings = _load_settings(project_root)
         policy = _load_json(project_root / "config" / "channel_policy.json")
         paste_policy = _load_json(project_root / "config" / "paste_policy.json")
         patterns = _load_json(project_root / "config" / "regex_patterns.json")
-        if not isinstance(settings, dict):
-            raise ValueError("settings.yaml은 mapping이어야 합니다")
     except Exception as exc:
         detail = f"설정 로드 실패: {type(exc).__name__}"
         return [Check("CONFIG", False, detail)] + [Check(name, False, detail) for name in scenario_names]
@@ -211,8 +265,15 @@ def collect_checks(project_root: Path = PROJECT_ROOT) -> list[Check]:
     server = _section(settings, "server")
     logging_cfg = _section(settings, "logging")
     ai_url = server.get("ai_base_url", "")
+    ai_token = (
+        os.environ.get("AI_API_TOKEN", "").strip()
+        or str(server.get("ai_token") or "").strip()
+    )
     dashboard_url = server.get("dashboard_url", "")
-    token = server.get("dashboard_token", "")
+    token = (
+        os.environ.get("AGENT_API_TOKEN", "").strip()
+        or str(server.get("dashboard_token") or "").strip()
+    )
     send_immediately = logging_cfg.get("send_immediately") is True
     try:
         timeout = max(0.5, min(float(server.get("request_timeout_sec", 10)), 15.0))
@@ -220,8 +281,19 @@ def collect_checks(project_root: Path = PROJECT_ROOT) -> list[Check]:
         timeout = 10.0
 
     ai_url_ok = _valid_base_url(ai_url, require_remote=False)
+    try:
+        ai_token_ok = len(ai_token.encode("ascii")) >= 32
+    except UnicodeEncodeError:
+        ai_token_ok = False
     dashboard_url_ok = _valid_base_url(dashboard_url, require_remote=True)
-    token_ok = isinstance(token, str) and bool(token.strip())
+    try:
+        token_ok = (
+            isinstance(token, str)
+            and len(token.encode("ascii")) >= 32
+            and token.strip() != DEFAULT_DASHBOARD_TOKEN
+        )
+    except UnicodeEncodeError:
+        token_ok = False
 
     ai_online = False
     ai_detail = "실제 AI URL이 필요합니다(mock 모드 불가)"
@@ -245,6 +317,29 @@ def collect_checks(project_root: Path = PROJECT_ROOT) -> list[Check]:
         except Exception as exc:
             ai_detail = f"AI 연결 실패: {type(exc).__name__}"
 
+    ai_token_verified = False
+    ai_token_detail = "AI_API_TOKEN 또는 ai_token에 32자 이상 ASCII 토큰이 필요함"
+    if ai_token_ok and ai_url_ok and ai_online:
+        try:
+            agent_check = _get_json(
+                ai_url.rstrip("/") + "/api/v1/agent-check",
+                timeout,
+                headers={"Authorization": f"Bearer {ai_token}"},
+            )
+            ai_token_verified = (
+                agent_check.get("status") == "ok"
+                and agent_check.get("ai_token") == "accepted"
+            )
+            ai_token_detail = (
+                "AI 인증 확인됨(값은 출력하지 않음)"
+                if ai_token_verified
+                else "AI 인증 확인 응답 이상"
+            )
+        except Exception as exc:
+            ai_token_detail = f"AI 인증 실패: {type(exc).__name__}"
+    elif ai_token_ok:
+        ai_token_detail = "AI 서버 연결 후 토큰 일치 확인 필요"
+
     dashboard_online = False
     dashboard_detail = "Windows PC에서 접속 가능한 원격 URL이 필요합니다"
     if dashboard_url_ok:
@@ -256,20 +351,24 @@ def collect_checks(project_root: Path = PROJECT_ROOT) -> list[Check]:
             dashboard_detail = f"대시보드 연결 실패: {type(exc).__name__}"
 
     dashboard_token_verified = False
-    dashboard_token_detail = "dashboard_token이 비어 있음"
+    dashboard_token_detail = (
+        "기본 데모 토큰을 새 값으로 교체하세요"
+        if isinstance(token, str) and token.strip() == DEFAULT_DASHBOARD_TOKEN
+        else "dashboard_token에 32자 이상 ASCII 토큰이 필요함"
+    )
     if token_ok and dashboard_url_ok and dashboard_online:
         try:
             agent_check = _get_json(
                 dashboard_url.rstrip("/") + "/api/v1/agent-check",
                 timeout,
-                headers={"X-Agent-Token": token.strip()},
+                headers={"X-Agent-Token": token},
             )
             dashboard_token_verified = (
                 agent_check.get("status") == "ok"
                 and agent_check.get("agent_token") == "accepted"
             )
             dashboard_token_detail = (
-                "Web R009 인증 확인됨(값은 출력하지 않음)"
+                "Web 보호 API 인증 확인됨(값은 출력하지 않음)"
                 if dashboard_token_verified
                 else "Web Agent 인증 확인 응답 이상"
             )
@@ -280,6 +379,7 @@ def collect_checks(project_root: Path = PROJECT_ROOT) -> list[Check]:
 
     checks = [
         Check("AI_SERVER", ai_url_ok and ai_online, ai_detail),
+        Check("AI_TOKEN", ai_token_verified, ai_token_detail),
         Check("DASHBOARD", dashboard_url_ok and dashboard_online, dashboard_detail),
         Check(
             "DASHBOARD_TOKEN",
@@ -292,16 +392,6 @@ def collect_checks(project_root: Path = PROJECT_ROOT) -> list[Check]:
             "탐지 즉시 전송" if send_immediately else "logging.send_immediately: true가 필요함",
         ),
     ]
-
-    baseline_ok = False
-    baseline_detail = "로컬 기준 없음"
-    try:
-        drives = load_internal_drives(project_root / "config" / LOCAL_BASELINE_PATH.name)
-        baseline_ok = True
-        baseline_detail = f"로컬 기준 정상({len(drives)}개 드라이브)"
-    except Exception as exc:
-        baseline_detail = f"사용 불가: {type(exc).__name__}; install/setup_agent.ps1 재실행 필요"
-    checks.append(Check("LOCAL_DRIVE_BASELINE", baseline_ok, baseline_detail))
 
     windows = sys.platform == "win32"
     user_agent_running = windows and _user_agent_task_running()
@@ -343,6 +433,7 @@ def collect_checks(project_root: Path = PROJECT_ROOT) -> list[Check]:
     common = (
         ai_url_ok
         and ai_online
+        and ai_token_verified
         and dashboard_url_ok
         and dashboard_online
         and dashboard_token_verified
@@ -410,7 +501,6 @@ def collect_checks(project_root: Path = PROJECT_ROOT) -> list[Check]:
                     (structured_files_ready, "구조화 파일 추출 모듈"),
                     (regex_ready, "regex_patterns"),
                     (file_guard_cfg.get("enabled") is True, "file_guard.enabled"),
-                    (baseline_ok, "internal_drives.local.json"),
                 ],
             ),
             _channel_check(
@@ -486,14 +576,16 @@ def main() -> int:
         f"[INFO] PREFLIGHT_SCOPE: exit 0은 {EXPECTED_MODEL_VERSION}과 로컬 준비 조건을 확인한 결과이며, "
         "실제 Windows 채널 E2E 완료 증거가 아닙니다."
     )
-    print("[INFO] DASHBOARD_TOKEN: Web R009 보호 API로 값의 일치를 확인하며 토큰 자체는 출력하지 않습니다.")
+    print("[INFO] DASHBOARD_TOKEN: Web 보호 API로 값의 일치를 확인하며 토큰 자체는 출력하지 않습니다.")
+    print("[INFO] AI_TOKEN: AI 보호 API로 Bearer 토큰 일치를 확인하며 값은 출력하지 않습니다.")
     print(
         "[INFO] PROXY_RUNTIME: CA·레지스트리·로컬 TCP 리스너·Outbound UDP/443 "
         "QUIC 차단 규칙을 자동 확인합니다. 실제 브라우저 업로드 요청은 별도로 시연하세요."
     )
     print(
-        "[INFO] USB_SAFETY: FIXED 외장 저장장치를 제거해 기준을 만들고, 내장 드라이브나 문자가 바뀌면 "
-        "기준을 다시 생성하세요. BLOCK은 대상 파일 사후 삭제이므로 실제 삭제 성공을 별도로 확인해야 합니다."
+        "[INFO] USB_SAFETY: Windows가 DRIVE_REMOVABLE로 보고한 USB만 감시합니다. "
+        "FIXED 외장 SSD는 안전한 장치 식별을 구현하기 전까지 시연에서 제외합니다. "
+        "BLOCK은 대상 파일 사후 삭제이므로 실제 삭제 성공을 별도로 확인해야 합니다."
     )
 
     scenario_names = {"CLIPBOARD", "USB_COPY", "EMAIL_ATTACHMENT", "WEB_UPLOAD", "CLOUD_DRIVE"}

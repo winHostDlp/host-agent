@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 from unittest.mock import Mock
 
@@ -72,6 +73,32 @@ def test_flush_counts_only_successful_posts_in_mixed_batch(
     )
 
     assert event_logger.flush_to_server() == 2
+
+
+def test_flush_preserves_original_event_timestamp(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalEventStore(tmp_path)
+    store.write(
+        channel="clipboard",
+        action="allowed",
+        process_name="chrome.exe",
+        hits=[],
+        extra={"event_id": "timestamp-contract"},
+    )
+    original = json.loads(store._active_path.read_text(encoding="utf-8"))
+    posted: list[dict[str, Any]] = []
+
+    def capture_post(*args: Any, **kwargs: Any) -> _Response:
+        posted.append(kwargs["json"])
+        return _Response()
+
+    monkeypatch.setattr("core_comm.event_logger.requests.post", capture_post)
+    event_logger = EventLogger(store=store, dashboard_url="https://dashboard.test")
+
+    assert event_logger.flush_to_server() == 1
+    assert posted[0]["timestamp"] == original["timestamp"]
 
 
 def test_immediate_post_retries_until_success(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:

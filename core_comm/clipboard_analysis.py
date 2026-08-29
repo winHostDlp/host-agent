@@ -9,8 +9,10 @@ exercise the failure paths on any CI host.
 import logging
 from dataclasses import replace
 from typing import Any, Callable
+from uuid import uuid4
 
 from core_comm.analysis_events import record_analysis_result
+from core_comm.payload_builder import AnalysisResult
 
 
 def is_same_paste_destination(
@@ -54,6 +56,9 @@ def run_clipboard_analysis(
     release_attempted = False
     release_succeeded = False
     block_confirmed = False
+    fallback_event_id = str(uuid4())
+    payload = None
+    event_recorded = False
 
     def _release_once() -> bool:
         nonlocal release_attempted, release_succeeded
@@ -74,6 +79,7 @@ def run_clipboard_analysis(
         return release_succeeded
 
     def _record(result: Any, event_id: str) -> None:
+        nonlocal event_recorded
         try:
             record_analysis_result(
                 event_logger,
@@ -85,6 +91,7 @@ def run_clipboard_analysis(
                 event_id=event_id,
                 detection_type="RULE_BASED" if api_client.is_mock else "HYBRID",
             )
+            event_recorded = True
         except Exception:
             try:
                 logger.exception("[clipboard] 분석 결과 기록 실패(판정 유지)")
@@ -160,11 +167,24 @@ def run_clipboard_analysis(
             logger.warning("[clipboard] AI 장애 Fail-Open 기록 — 붙여넣기 허용")
         else:
             logger.info("[clipboard] AI allow 기록 — 오탐 복구: 붙여넣기 재발행")
-    except Exception:
+    except Exception as exc:
         try:
             logger.exception("[clipboard] 비동기 처리 예외 — Fail-Open 붙여넣기 허용")
         except Exception:
             pass
+        failure_event_id = getattr(payload, "request_id", "") or fallback_event_id
+        if not event_recorded:
+            _record(
+                AnalysisResult(
+                    request_id=failure_event_id,
+                    confidence_score=0.0,
+                    action="allow",
+                    reason=f"클립보드 AI 처리 실패: {exc} — Fail-Open 허용",
+                    model_version="unavailable",
+                    analysis_failed=True,
+                ),
+                failure_event_id,
+            )
     finally:
         if not block_confirmed:
             _release_once()

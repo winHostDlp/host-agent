@@ -11,42 +11,10 @@ from unittest.mock import Mock
 import pytest
 import yaml
 
-from core_comm.drive_baseline import DriveBaselineError, load_internal_drives
 from scripts import demo_preflight
 
 
-def test_drive_baseline_is_machine_local_and_requires_system_drive(tmp_path, monkeypatch):
-    monkeypatch.setenv("SystemDrive", "C:")
-    local = tmp_path / "internal_drives.local.json"
-    local.write_text(json.dumps({"internal_drives": ["c:", "D:"]}), encoding="utf-8")
-
-    assert load_internal_drives(local) == {"C:", "D:"}
-
-    local.write_text(json.dumps({"internal_drives": ["D:"]}), encoding="utf-8")
-    with pytest.raises(DriveBaselineError, match="시스템 드라이브 C:"):
-        load_internal_drives(local)
-
-
-def test_legacy_tracked_baseline_is_never_used(tmp_path, monkeypatch):
-    monkeypatch.setenv("SystemDrive", "C:")
-    (tmp_path / "internal_drives.json").write_text(
-        json.dumps({"internal_drives": ["C:"]}), encoding="utf-8"
-    )
-
-    with pytest.raises(DriveBaselineError, match="setup_agent.ps1"):
-        load_internal_drives(tmp_path / "internal_drives.local.json")
-
-
-def test_drive_baseline_refuses_when_system_drive_is_unknown(tmp_path, monkeypatch):
-    monkeypatch.delenv("SystemDrive", raising=False)
-    local = tmp_path / "internal_drives.local.json"
-    local.write_text(json.dumps({"internal_drives": ["C:"]}), encoding="utf-8")
-
-    with pytest.raises(DriveBaselineError, match="SystemDrive"):
-        load_internal_drives(local)
-
-
-def test_setup_agent_is_ps51_safe_and_starts_registered_user_task():
+def test_setup_agent_is_ps51_safe_and_requires_explicit_start():
     setup = (
         Path(__file__).resolve().parents[1] / "install" / "setup_agent.ps1"
     ).read_text(encoding="utf-8")
@@ -55,6 +23,12 @@ def test_setup_agent_is_ps51_safe_and_starts_registered_user_task():
     assert "pip install pywin32" not in setup
     assert "requirements.txt" in setup
     assert "Start-ScheduledTask -TaskName $TaskName" in setup
+    assert "[switch]$StartAgent" in setup
+    assert "if ($StartAgent)" in setup
+    assert "Disable-ScheduledTask -TaskName $TaskName" in setup
+    assert '$task.State -ne "Disabled"' in setup
+    assert "비활성화 확인 실패로 등록을 취소" in setup
+    assert "Enable-ScheduledTask -TaskName $TaskName" in setup
     assert "Start-Process -FilePath $PythonExe" not in setup
     assert "Stop-ScheduledTask -TaskName $TaskName" in setup
     assert "-Execute $PythonWExe" in setup
@@ -91,22 +65,18 @@ def _load_usb_guard_with_win32_stubs(monkeypatch):
     return module
 
 
-def test_file_guard_refuses_to_construct_without_safe_baseline(monkeypatch):
+def test_file_guard_monitors_removable_drives_but_never_fixed_drives(monkeypatch):
     usb_guard = _load_usb_guard_with_win32_stubs(monkeypatch)
-    monkeypatch.setattr(
-        usb_guard,
-        "load_internal_drives",
-        Mock(side_effect=DriveBaselineError("setup_agent.ps1 재실행")),
+    guard = usb_guard.UsbGuardUserMode(
+        rule_filter=Mock(),
+        payload_builder=Mock(),
+        api_client=Mock(),
+        event_logger=Mock(),
+        file_inspector=Mock(),
     )
 
-    with pytest.raises(DriveBaselineError, match="setup_agent.ps1"):
-        usb_guard.UsbGuardUserMode(
-            rule_filter=Mock(),
-            payload_builder=Mock(),
-            api_client=Mock(),
-            event_logger=Mock(),
-            file_inspector=Mock(),
-        )
+    assert guard._is_external("E:", usb_guard.win32con.DRIVE_REMOVABLE) is True
+    assert guard._is_external("D:", usb_guard.win32con.DRIVE_FIXED) is False
 
 
 def _write_ready_project(root: Path, token: str) -> None:
@@ -117,6 +87,7 @@ def _write_ready_project(root: Path, token: str) -> None:
             {
                 "server": {
                     "ai_base_url": "https://ai.example",
+                    "ai_token": token,
                     "dashboard_url": "http://192.168.0.39:8000",
                     "dashboard_token": token,
                     "request_timeout_sec": 2,
@@ -147,9 +118,6 @@ def _write_ready_project(root: Path, token: str) -> None:
     (config / "regex_patterns.json").write_text(
         json.dumps({"patterns": [{"id": "rrn", "regex": "[0-9]+"}]}), encoding="utf-8"
     )
-    (config / "internal_drives.local.json").write_text(
-        json.dumps({"internal_drives": ["C:"]}), encoding="utf-8"
-    )
 
 
 class _Response:
@@ -178,8 +146,10 @@ def _mock_user_runtime(
 def test_preflight_reports_all_implemented_scenarios_without_exposing_token(
     tmp_path, monkeypatch
 ):
-    token = "do-not-print-this-token"
-    _write_ready_project(tmp_path, token)
+    token = "do-not-print-this-token-32-bytes-minimum"
+    _write_ready_project(tmp_path, "tracked-placeholder-token-32-bytes")
+    monkeypatch.setenv("AI_API_TOKEN", token)
+    monkeypatch.setenv("AGENT_API_TOKEN", token)
     monkeypatch.setenv("SystemDrive", "C:")
     monkeypatch.setattr(demo_preflight.sys, "platform", "win32")
     monkeypatch.setattr(demo_preflight, "_module_available", lambda name: True)
@@ -191,6 +161,9 @@ def test_preflight_reports_all_implemented_scenarios_without_exposing_token(
         if url == "https://ai.example/":
             assert headers is None
             return _Response({"status": "running", "engine": "koelectra-dlp-v7"})
+        if url == "https://ai.example/api/v1/agent-check":
+            assert headers == {"Authorization": f"Bearer {token}"}
+            return _Response({"status": "ok", "ai_token": "accepted"})
         if url == "http://192.168.0.39:8000/health":
             assert headers is None
             return _Response({"status": "ok"})
@@ -241,7 +214,7 @@ def test_preflight_reports_all_implemented_scenarios_without_exposing_token(
 def test_preflight_rejects_dashboard_token_mismatch_without_exposing_token(
     tmp_path, monkeypatch
 ):
-    token = "configured-but-rejected-token"
+    token = "configured-but-rejected-token-32-bytes"
     _write_ready_project(tmp_path, token)
     monkeypatch.setenv("SystemDrive", "C:")
     monkeypatch.setattr(demo_preflight.sys, "platform", "win32")
@@ -257,6 +230,8 @@ def test_preflight_rejects_dashboard_token_mismatch_without_exposing_token(
     def fake_get(url, timeout, headers=None):
         if url == "https://ai.example/":
             return _Response({"status": "running", "engine": "koelectra-dlp-v7"})
+        if url == "https://ai.example/api/v1/agent-check":
+            return _Response({"status": "ok", "ai_token": "accepted"})
         if url == "http://192.168.0.39:8000/health":
             return _Response({"status": "ok"})
         if url == "http://192.168.0.39:8000/api/v1/agent-check":
@@ -275,17 +250,72 @@ def test_preflight_rejects_dashboard_token_mismatch_without_exposing_token(
     )
 
 
-def test_preflight_rejects_mock_ai_loopback_dashboard_and_missing_baseline(
+def test_preflight_rejects_non_ascii_ai_token_before_agent_check(
     tmp_path, monkeypatch
 ):
-    _write_ready_project(tmp_path, "configured-token")
+    non_ascii_token = "가" * 32
+    _write_ready_project(tmp_path, non_ascii_token)
+    settings_path = tmp_path / "config" / "settings.yaml"
+    settings = yaml.safe_load(settings_path.read_text(encoding="utf-8"))
+    settings["server"]["dashboard_token"] = "dashboard-token-32-characters-minimum"
+    settings_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
+
+    def fake_get(url, timeout, headers=None):
+        if url == "https://ai.example/":
+            return _Response({"status": "running", "engine": "koelectra-dlp-v7"})
+        if url == "https://ai.example/api/v1/agent-check":
+            raise AssertionError("invalid AI token must not be sent")
+        if url == "http://192.168.0.39:8000/health":
+            return _Response({"status": "ok"})
+        if url == "http://192.168.0.39:8000/api/v1/agent-check":
+            return _Response({"status": "ok", "agent_token": "accepted"})
+        raise AssertionError(f"unexpected URL: {url}")
+
+    monkeypatch.setattr(demo_preflight.requests, "get", fake_get)
+    checks = {check.name: check for check in demo_preflight.collect_checks(tmp_path)}
+
+    assert checks["AI_TOKEN"].ready is False
+    assert "ASCII" in checks["AI_TOKEN"].detail
+
+
+def test_preflight_rejects_short_dashboard_token_before_agent_check(
+    tmp_path, monkeypatch
+):
+    ai_token = "ai-token-that-is-at-least-32-characters"
+    _write_ready_project(tmp_path, ai_token)
+    settings_path = tmp_path / "config" / "settings.yaml"
+    settings = yaml.safe_load(settings_path.read_text(encoding="utf-8"))
+    settings["server"]["dashboard_token"] = "short"
+    settings_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
+
+    def fake_get(url, timeout, headers=None):
+        if url == "https://ai.example/":
+            return _Response({"status": "running", "engine": "koelectra-dlp-v7"})
+        if url == "https://ai.example/api/v1/agent-check":
+            return _Response({"status": "ok", "ai_token": "accepted"})
+        if url == "http://192.168.0.39:8000/health":
+            return _Response({"status": "ok"})
+        if url == "http://192.168.0.39:8000/api/v1/agent-check":
+            raise AssertionError("short dashboard token must not be sent")
+        raise AssertionError(f"unexpected URL: {url}")
+
+    monkeypatch.setattr(demo_preflight.requests, "get", fake_get)
+    checks = {check.name: check for check in demo_preflight.collect_checks(tmp_path)}
+
+    assert checks["DASHBOARD_TOKEN"].ready is False
+    assert "32자 이상 ASCII" in checks["DASHBOARD_TOKEN"].detail
+
+
+def test_preflight_rejects_mock_ai_loopback_dashboard_and_disabled_delivery(
+    tmp_path, monkeypatch
+):
+    _write_ready_project(tmp_path, "configured-token-32-bytes-minimum")
     settings_path = tmp_path / "config" / "settings.yaml"
     settings = yaml.safe_load(settings_path.read_text(encoding="utf-8"))
     settings["server"]["ai_base_url"] = ""
     settings["server"]["dashboard_url"] = "http://127.0.0.1:8000"
     settings["logging"]["send_immediately"] = False
     settings_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
-    (tmp_path / "config" / "internal_drives.local.json").unlink()
     monkeypatch.setattr(demo_preflight.sys, "platform", "win32")
     _mock_user_runtime(monkeypatch, task=False, listener=False, quic=False)
     monkeypatch.setattr(
@@ -299,7 +329,6 @@ def test_preflight_rejects_mock_ai_loopback_dashboard_and_missing_baseline(
     assert checks["AI_SERVER"].ready is False
     assert checks["DASHBOARD"].ready is False
     assert checks["SEND_IMMEDIATELY"].ready is False
-    assert checks["LOCAL_DRIVE_BASELINE"].ready is False
     assert all(
         checks[name].ready is False
         for name in ("CLIPBOARD", "USB_COPY", "EMAIL_ATTACHMENT", "WEB_UPLOAD", "CLOUD_DRIVE")
@@ -309,7 +338,7 @@ def test_preflight_rejects_mock_ai_loopback_dashboard_and_missing_baseline(
 def test_preflight_requires_structured_file_extractors_for_file_scenarios(
     tmp_path, monkeypatch
 ):
-    _write_ready_project(tmp_path, "configured-token")
+    _write_ready_project(tmp_path, "configured-token-32-bytes-minimum")
     monkeypatch.setenv("SystemDrive", "C:")
     monkeypatch.setattr(demo_preflight.sys, "platform", "win32")
     monkeypatch.setattr(
@@ -324,6 +353,8 @@ def test_preflight_requires_structured_file_extractors_for_file_scenarios(
     def fake_get(url, timeout, headers=None):
         if url == "https://ai.example/":
             return _Response({"status": "running", "engine": "koelectra-dlp-v7"})
+        if url == "https://ai.example/api/v1/agent-check":
+            return _Response({"status": "ok", "ai_token": "accepted"})
         if url == "http://192.168.0.39:8000/health":
             return _Response({"status": "ok"})
         if url == "http://192.168.0.39:8000/api/v1/agent-check":
@@ -345,7 +376,7 @@ def test_preflight_requires_structured_file_extractors_for_file_scenarios(
 def test_preflight_requires_running_user_task_proxy_listener_and_quic_rule(
     tmp_path, monkeypatch
 ):
-    token = "runtime-check-token"
+    token = "runtime-check-token-32-bytes-minimum"
     _write_ready_project(tmp_path, token)
     monkeypatch.setenv("SystemDrive", "C:")
     monkeypatch.setattr(demo_preflight.sys, "platform", "win32")
@@ -356,6 +387,8 @@ def test_preflight_requires_running_user_task_proxy_listener_and_quic_rule(
     def fake_get(url, timeout, headers=None):
         if url == "https://ai.example/":
             return _Response({"status": "running", "engine": "koelectra-dlp-v7"})
+        if url == "https://ai.example/api/v1/agent-check":
+            return _Response({"status": "ok", "ai_token": "accepted"})
         if url == "http://192.168.0.39:8000/health":
             return _Response({"status": "ok"})
         if url == "http://192.168.0.39:8000/api/v1/agent-check":
@@ -420,6 +453,92 @@ def _load_main_agent_without_windows_modules(monkeypatch):
     return module
 
 
+def test_main_agent_merges_ignored_local_settings_and_prefers_env_token(
+    tmp_path,
+    monkeypatch,
+):
+    main_agent = _load_main_agent_without_windows_modules(monkeypatch)
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "settings.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "server": {
+                    "ai_base_url": "https://tracked.example",
+                    "ai_token": "tracked-token",
+                    "request_timeout_sec": 10,
+                },
+                "agent": {"department": "Tracked"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (config / "settings.local.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "server": {"ai_base_url": "https://local.example"},
+                "agent": {"department": "Local"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main_agent, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setenv("AI_API_TOKEN", "environment-token-32-bytes-minimum")
+    captured = {}
+
+    class CapturingApiClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(main_agent, "ApiClient", CapturingApiClient)
+
+    settings = main_agent.load_settings()
+    main_agent.build_api_client(settings)
+
+    assert settings["server"]["ai_base_url"] == "https://local.example"
+    assert settings["server"]["request_timeout_sec"] == 10
+    assert settings["agent"]["department"] == "Local"
+    assert captured["token"] == "environment-token-32-bytes-minimum"
+
+
+def test_runtime_identity_checks_bind_task_and_listener_to_current_project(
+    monkeypatch,
+):
+    expected = (
+        Path(r"C:\project\.venv\Scripts\pythonw.exe"),
+        Path(r"C:\project\sentry_user_agent.py"),
+        Path(r"C:\project"),
+    )
+    scripts = []
+    monkeypatch.setattr(demo_preflight, "_expected_user_agent_paths", lambda: expected)
+    monkeypatch.setattr(
+        demo_preflight,
+        "_powershell_boolean",
+        lambda script, timeout=5.0: scripts.append(script) or True,
+    )
+
+    assert demo_preflight._user_agent_task_running() is True
+    assert demo_preflight._proxy_listener_running(8082) is True
+
+    task_script, listener_script = scripts
+    for fragment in (
+        "$task.State -eq 'Running'",
+        "$task.Principal.UserId -ieq $currentUser",
+        "$action.Execute -ieq $expectedExe",
+        "$actualArgs -ieq $expectedScript",
+        "$action.WorkingDirectory -ieq $expectedDir",
+    ):
+        assert fragment in task_script
+    for fragment in (
+        "Get-NetTCPConnection",
+        "OwningProcess",
+        "Win32_Process",
+        "$process.ExecutablePath -ieq $expectedExe",
+        "$process.CommandLine",
+    ):
+        assert fragment in listener_script
+
+
 def test_run_registers_process_signals_only_on_main_thread(monkeypatch):
     main_agent = _load_main_agent_without_windows_modules(monkeypatch)
     monkeypatch.setattr(main_agent, "load_settings", lambda: {"agent": {}})
@@ -482,5 +601,6 @@ def test_preflight_output_marks_messenger_as_clipboard_and_print_unsupported(
     assert "보호 API로 값의 일치를 확인" in output
     assert "로컬 TCP 리스너" in output
     assert "QUIC" in output
-    assert "FIXED 외장 저장장치" in output
+    assert "FIXED 외장 SSD" in output
+    assert "DRIVE_REMOVABLE" in output
     assert "사후 삭제" in output

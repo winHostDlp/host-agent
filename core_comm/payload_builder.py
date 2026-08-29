@@ -49,8 +49,12 @@ _SEVERITY_RANK = {"critical": 3, "high": 2, "medium": 1, "low": 0}
 # AI 전송 시 매치 위치 앞뒤로 포함할 문자 수
 DEFAULT_CONTEXT_CHARS = 200
 
-# 0 이하면 제한 없음 (전체 텍스트 전송 — 하위 호환용)
-DEFAULT_MAX_TEXT_CHARS = 0
+# AI AgentRequest.snippet 계약과 동일한 절대 상한
+DEFAULT_MAX_TEXT_CHARS = 4000
+AI_MAX_PATTERN_ITEMS = 100
+AI_MAX_PATTERN_CHARS = 100
+AI_MAX_USER_ID_CHARS = 100
+AI_MAX_METADATA_STRING_CHARS = 500
 
 
 @dataclass
@@ -80,16 +84,22 @@ class AnalysisPayload:
         """AI 서버 AgentRequest 포맷으로 직렬화한다."""
         max_sev = self.metadata.get("max_severity", "medium")
         # matched_patterns는 패턴 ID 문자열 리스트 (중복 제거)
-        pattern_ids = list(dict.fromkeys(m.pattern_id for m in self.matched_patterns))
+        pattern_ids: list[str] = []
+        for match in self.matched_patterns:
+            pattern_id = str(match.pattern_id).strip()[:AI_MAX_PATTERN_CHARS]
+            if pattern_id and pattern_id not in pattern_ids:
+                pattern_ids.append(pattern_id)
+            if len(pattern_ids) >= AI_MAX_PATTERN_ITEMS:
+                break
         return {
             "event_id":         self.request_id,
             "channel":          self.channel,
-            "user_id":          self.user_id,
+            "user_id":          str(self.user_id).strip()[:AI_MAX_USER_ID_CHARS] or "unknown",
             "matched_patterns": pattern_ids,
-            "snippet":          self.text,
+            "snippet":          self.text[:DEFAULT_MAX_TEXT_CHARS],
             "metadata": {
-                "app":           self.process,
-                "severity_hint": max_sev,
+                "app":           str(self.process)[:AI_MAX_METADATA_STRING_CHARS],
+                "severity_hint": str(max_sev)[:AI_MAX_METADATA_STRING_CHARS],
             },
         }
 
@@ -210,7 +220,10 @@ class PayloadBuilder:
         context_chars: int = DEFAULT_CONTEXT_CHARS,
         user_id: str = "",
     ) -> None:
-        self._max_text_chars  = max_text_chars
+        requested_max = int(max_text_chars or DEFAULT_MAX_TEXT_CHARS)
+        if requested_max <= 0:
+            requested_max = DEFAULT_MAX_TEXT_CHARS
+        self._max_text_chars  = min(max(requested_max, 1), DEFAULT_MAX_TEXT_CHARS)
         self._max_per_pattern = max_per_pattern
         self._context_chars   = context_chars
         self._user_id         = user_id or os.environ.get("USERNAME", "unknown")
@@ -225,7 +238,7 @@ class PayloadBuilder:
         matches = _collect_matches(text, hits, self._max_per_pattern)
 
         snippet = _extract_snippets(text, matches, self._context_chars)
-        if self._max_text_chars and len(snippet) > self._max_text_chars:
+        if len(snippet) > self._max_text_chars:
             snippet = snippet[: self._max_text_chars]
 
         severities = [h.get("severity", "medium") for h in hits]
@@ -265,6 +278,8 @@ class ResponseParser:
         raw_event_id = raw.get("event_id")
         if not isinstance(raw_event_id, str) or not raw_event_id.strip():
             raise ValueError("AI 응답 event_id가 누락되었거나 문자열이 아닙니다.")
+        if len(raw_event_id) > 120:
+            raise ValueError("AI 응답 event_id는 최대 120자여야 합니다.")
         if request_id and raw_event_id != request_id:
             raise ValueError(
                 f"AI 응답 event_id가 요청과 다릅니다: {raw_event_id!r} != {request_id!r}"
@@ -287,23 +302,28 @@ class ResponseParser:
         raw_model_version = raw.get("model_version")
         if not isinstance(raw_model_version, str) or not raw_model_version.strip():
             raise ValueError("AI 응답 model_version이 누락되었거나 문자열이 아닙니다.")
+        model_version = raw_model_version.strip()
+        if len(model_version) > 100:
+            raise ValueError("AI 응답 model_version은 최대 100자여야 합니다.")
 
         raw_latency = raw.get("latency_ms")
         if isinstance(raw_latency, bool) or not isinstance(raw_latency, (int, float)):
             raise ValueError("AI 응답 latency_ms가 누락되었거나 숫자가 아닙니다.")
         latency = float(raw_latency)
-        if not math.isfinite(latency) or latency < 0.0:
-            raise ValueError("AI 응답 latency_ms는 0 이상의 유한한 숫자여야 합니다.")
+        if not math.isfinite(latency) or not 0.0 <= latency <= 600000.0:
+            raise ValueError("AI 응답 latency_ms는 0~600000의 유한한 숫자여야 합니다.")
 
         raw_reason = raw.get("reason")
         if raw_reason is not None and not isinstance(raw_reason, str):
             raise ValueError("AI 응답 reason은 문자열 또는 null이어야 합니다.")
+        if isinstance(raw_reason, str) and len(raw_reason) > 500:
+            raise ValueError("AI 응답 reason은 최대 500자여야 합니다.")
 
         return AnalysisResult(
             request_id=raw_event_id,
             confidence_score=confidence,
             action=action,
             reason=raw_reason or "",
-            model_version=raw_model_version,
+            model_version=model_version,
             latency_ms=latency,
         )

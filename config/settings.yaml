@@ -3,9 +3,11 @@
 server:
   # AI 서버 URL. 비워두면 mock 모드로 동작 (severity 기반 즉시 판단)
   ai_base_url: ""
+  # 실제 값은 Git에서 제외된 settings.local.yaml 또는 AI_API_TOKEN 환경변수에 둠
+  ai_token: ""
   # 웹 대시보드 베이스 URL (uvicorn 기본 포트 8000)
   dashboard_url: "http://127.0.0.1:8000"
-  # 웹 대시보드 인증 토큰 (X-Agent-Token 헤더)
+  # 실제 값은 settings.local.yaml 또는 AGENT_API_TOKEN 환경변수에 둠
   dashboard_token: "sentry-agent-demo-token"
   request_timeout_sec: 10
 
@@ -22,7 +24,7 @@ agent:
   department: "Unknown"
 
   # AI 전송 페이로드 설정
-  ai_max_text_chars: 0          # 0 = 무제한
+  ai_max_text_chars: 4000       # AI AgentRequest.snippet 절대 상한과 동일
   ai_max_matches_per_pattern: 10
   ai_context_chars: 200         # 매치 앞뒤 포함 문자 수
 

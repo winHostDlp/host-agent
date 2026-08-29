@@ -14,14 +14,20 @@
 .PARAMETER AgentDir
     에이전트 루트 디렉토리. 기본값: 스크립트의 상위 디렉토리.
 
+.PARAMETER StartAgent
+    설치 직후 예약 작업을 활성화하고 시작합니다. 생략하면 잘못된
+    mock/loopback 설정으로 채널이 시작되지 않도록 비활성 상태로 등록만 합니다.
+
 .EXAMPLE
     .\setup_agent.ps1
     .\setup_agent.ps1 -PythonExe "C:\Python313\python.exe"
+    .\setup_agent.ps1 -PythonExe ".\.venv\Scripts\python.exe" -StartAgent
 #>
 
 param(
     [string]$PythonExe = "",
-    [string]$AgentDir  = ""
+    [string]$AgentDir  = "",
+    [switch]$StartAgent
 )
 
 $ErrorActionPreference = "Stop"
@@ -96,49 +102,6 @@ if ($dependencyExitCode -ne 0) {
 }
 Write-OK "런타임 의존성 확인"
 
-# ── 내장 드라이브 기준 파일 생성 ──────────────────────────────────────────────
-# USB가 꽂히지 않은 상태에서 현재 로컬 드라이브를 내장으로 저장.
-# 이 파일을 기준으로 이후 추가되는 드라이브를 이동식으로 판단한다.
-
-Write-Step "이 PC의 내장 드라이브 기준 파일 생성 (config/internal_drives.local.json)"
-Write-Warn "  이동식 저장장치(USB, 외장 HDD 등)가 모두 제거된 상태인지 확인하세요."
-Write-Warn "  Windows가 FIXED로 인식하는 외장 SSD도 반드시 제거하세요."
-Write-Warn "  현재 FIXED 드라이브만 내장 기준으로 기록합니다."
-$internalDrivesScript = @"
-import win32api, win32file, win32con, json, os, pathlib
-def iter_drives():
-    bitmask = win32api.GetLogicalDrives()
-    for i in range(26):
-        if bitmask & (1 << i):
-            letter = chr(ord('A') + i) + ':'
-            try:
-                dtype = win32file.GetDriveType(letter + chr(92))
-                yield letter, dtype
-            except Exception:
-                pass
-drives = list(iter_drives())
-removable = [l for l, t in drives if t == win32con.DRIVE_REMOVABLE]
-if removable:
-    raise RuntimeError('이동식 드라이브를 모두 제거한 뒤 다시 실행하세요: ' + str(removable))
-# ponytail: GetDriveType은 FIXED로 보고되는 외장 디스크를 구분하지 못한다.
-# 자동 교정이 필요하면 Win32_DiskDrive BusType 매핑으로 교체한다.
-internal = [l for l, t in drives if t == win32con.DRIVE_FIXED]
-out = pathlib.Path(r'$AgentDir\config\internal_drives.local.json')
-system_drive = os.environ.get('SystemDrive', '').upper()
-if not internal or not system_drive or system_drive not in internal:
-    raise RuntimeError('시스템 드라이브를 포함한 안전한 내장 드라이브 기준을 만들지 못했습니다.')
-tmp = out.with_suffix(out.suffix + '.tmp')
-tmp.write_text(json.dumps({'internal_drives': internal, '_comment': '이 PC의 로컬 기준. Git에 올리지 마세요. 이동식 저장장치를 모두 제거한 상태에서 생성했습니다.'}, ensure_ascii=False, indent=2), encoding='utf-8')
-tmp.replace(out)
-print('OK internal_drives.local=' + str(internal))
-"@
-$result = & $PythonExe -c $internalDrivesScript 2>&1
-if ($result -match "^OK") {
-    Write-OK "내장 드라이브 기준 저장: $result"
-} else {
-    Write-Err "내장 드라이브 기준 생성 실패. 안전을 위해 FileGuard를 설치하지 않습니다: $result"
-}
-
 # ════════════════════════════════════════════════════════════════════════════════
 # Task Scheduler 작업 등록 (SentryUserAgent)
 # ════════════════════════════════════════════════════════════════════════════════
@@ -184,16 +147,32 @@ Register-ScheduledTask `
 
 Write-OK "Task Scheduler 작업 등록 완료"
 
-# 등록된 작업으로 현재 사용자 세션에서 즉시 시작
-Write-Step "등록된 Task Scheduler 작업으로 유저 에이전트 시작"
-Start-ScheduledTask -TaskName $TaskName
-Start-Sleep -Seconds 1
-$task = Get-ScheduledTask -TaskName $TaskName
-if ($task.State -eq "Running") {
-    Write-OK "유저 에이전트 작업 실행 중"
+if ($StartAgent) {
+    Write-Step "등록된 Task Scheduler 작업으로 유저 에이전트 시작"
+    Enable-ScheduledTask -TaskName $TaskName | Out-Null
+    Start-ScheduledTask -TaskName $TaskName
+    Start-Sleep -Seconds 1
+    $task = Get-ScheduledTask -TaskName $TaskName
+    if ($task.State -eq "Running") {
+        Write-OK "유저 에이전트 작업 실행 중"
+    } else {
+        $taskInfo = Get-ScheduledTaskInfo -TaskName $TaskName
+        Write-Err "유저 에이전트 시작 실패: State=$($task.State), LastTaskResult=$($taskInfo.LastTaskResult) — $AgentDir\logs\user_agent.log를 확인하세요."
+    }
 } else {
-    $taskInfo = Get-ScheduledTaskInfo -TaskName $TaskName
-    Write-Err "유저 에이전트 시작 실패: State=$($task.State), LastTaskResult=$($taskInfo.LastTaskResult) — $AgentDir\logs\user_agent.log를 확인하세요."
+    try {
+        Disable-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Out-Null
+        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+        if ($task.State -ne "Disabled") {
+            throw "예약 작업 상태가 Disabled가 아닙니다: $($task.State)"
+        }
+        Write-Warn "작업을 비활성 상태로 등록했습니다. AI·대시보드 설정을 완료한 뒤 활성화하세요."
+    } catch {
+        # 잘못된 mock/loopback 설정으로 다음 로그온에 시작되는 것보다
+        # 등록 자체를 되돌리는 편이 안전하다.
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+        Write-Err "예약 작업 비활성화 확인 실패로 등록을 취소했습니다: $_"
+    }
 }
 
 # ── 완료 요약 ─────────────────────────────────────────────────────────────────
@@ -201,12 +180,13 @@ if ($task.State -eq "Running") {
 Write-Host ""
 Write-Host "══════════════════════════════════════════" -ForegroundColor Cyan
 Write-OK "설치 완료"
-Write-Host "  서비스 : 미설치 (R009 발표 범위 밖의 SMTP/HTTP 시스템 채널 제외)"
+Write-Host "  서비스 : 미설치 (이번 발표 범위 밖의 SMTP/HTTP 시스템 채널 제외)"
 Write-Host "  작업   : $TaskName (로그온 트리거)"
 Write-Host "  로그   : $AgentDir\logs\"
 Write-Host ""
 Write-Host "설정 변경 후 사용하는 실행 계층을 재시작하세요:"
 Write-Host "  사용자 채널(Clipboard/Outlook/FileGuard/WebProxy):"
+Write-Host "    Enable-ScheduledTask -TaskName $TaskName"
 Write-Host "    Stop-ScheduledTask -TaskName $TaskName"
 Write-Host "    Start-ScheduledTask -TaskName $TaskName"
 Write-Host "  재시작 후 logs\user_agent.log에서 실제 채널 시작 상태를 확인하세요."

@@ -20,8 +20,10 @@ from email import message_from_bytes
 from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import urlparse, parse_qs
+from uuid import uuid4
 
 from core_comm.analysis_events import record_analysis_result
+from core_comm.payload_builder import AnalysisResult
 from core_comm.review_notifier import notify_review
 
 # Content-Type → 확장자 매핑 (업로드 파일 타입 추론용)
@@ -135,8 +137,12 @@ class _DLPAddon:
         """요청이 서버로 전달되기 전 호출. block 결정 시 즉시 응답 설정."""
         try:
             self._register_upload_init(flow)
+        except Exception:
+            # 세션 메타데이터 추적 실패가 실제 DLP 검사를 건너뛰게 하지 않는다.
+            logger.debug("[WebProxy] 업로드 초기화 추적 실패", exc_info=True)
 
-            # ── 업로드 관련 요청 사전 로그 (도메인 파악용) ──────────────────────
+        try:
+            # ── 업로드 관련 요청 사전 로그 (도메인 파악용) ──────────────────
             url = flow.request.pretty_url
             url_lower = url.lower()
             host = flow.request.pretty_host.lower()
@@ -158,10 +164,26 @@ class _DLPAddon:
                     len(flow.request.content or b""),
                     url[:200],
                 )
-
-            self._handle(flow)
         except Exception:
-            logger.exception("[WebProxy] request 처리 중 예외")
+            logger.debug("[WebProxy] 요청 사전 로그 실패", exc_info=True)
+
+        try:
+            channel = self._get_dlp_channel(flow)
+        except Exception as exc:
+            channel = self._fallback_channel(flow)
+            if channel:
+                self._record_pipeline_failure(flow, channel, "채널 판별", exc)
+            logger.exception("[WebProxy] 채널 판별 중 예외 — 업로드 허용")
+            return
+
+        if not channel:
+            return
+
+        try:
+            self._handle(flow, channel=channel)
+        except Exception as exc:
+            self._record_pipeline_failure(flow, channel, "본문 검사", exc)
+            logger.exception("[WebProxy] request 처리 중 예외 — ALLOWED Fail-Open 기록")
 
     def response(self, flow) -> None:  # noqa: ANN001
         """메일 전송 요청에 대한 응답만 로그. 업로드 세션 URI 캡처."""
@@ -336,10 +358,64 @@ class _DLPAddon:
                 preview = preview[: self._BODY_PREVIEW] + "..."
             logger.info("[WebProxy]    body preview: %s", preview)
 
-    def _handle(self, flow) -> None:
+    def _fallback_channel(self, flow) -> str:  # noqa: ANN001
+        """분류기 예외 시 대상 도메인만으로 진단 이벤트 채널을 복구한다."""
+        try:
+            host = flow.request.pretty_host.lower()
+            if self._is_drive_target(host):
+                return "drive_upload"
+            if self._is_target(host):
+                return "web_mail"
+        except Exception:
+            pass
+        return ""
+
+    def _record_pipeline_failure(
+        self,
+        flow,  # noqa: ANN001
+        channel: str,
+        stage: str,
+        exc: Exception,
+    ) -> None:
+        """Record one stable Fail-Open event without exposing exception text."""
+        event_id = str(uuid4())
+        try:
+            host = flow.request.pretty_host.lower()
+        except Exception:
+            host = "unknown"
+        try:
+            url = flow.request.pretty_url
+        except Exception:
+            url = ""
+        result = AnalysisResult(
+            request_id=event_id,
+            confidence_score=0.0,
+            action="allow",
+            reason=(
+                f"웹 업로드 {stage} 실패({type(exc).__name__}) — Fail-Open 허용"
+            ),
+            model_version="unavailable",
+            analysis_failed=True,
+        )
+        try:
+            record_analysis_result(
+                self._event_logger,
+                result,
+                channel=channel,
+                process_name=f"browser@{host}",
+                hits=[],
+                text=None,
+                event_id=event_id,
+                detection_type="RULE_BASED",
+                metadata={"url": url},
+            )
+        except Exception:
+            logger.exception("[WebProxy] Fail-Open 이벤트 기록 실패")
+
+    def _handle(self, flow, channel: Optional[str] = None) -> None:  # noqa: ANN001
         from mitmproxy.http import Response  # 지연 임포트 — 서비스 시 유효
 
-        channel = self._get_dlp_channel(flow)
+        channel = channel or self._get_dlp_channel(flow)
         if not channel:
             return
 
@@ -384,13 +460,7 @@ class _DLPAddon:
 
         host = flow.request.pretty_host.lower()
         process_name = f"browser@{host}"
-        payload = self._builder.build(text, hits, channel, process_name)
-        result  = self._api.analyze(payload)
-
-        logger.info(
-            "[WebProxy] AI 판단: action=%s confidence=%.2f url=%s",
-            result.action, result.confidence_score, flow.request.pretty_url,
-        )
+        event_id = str(uuid4())
 
         def _record(final_result: Any) -> None:
             try:
@@ -401,7 +471,7 @@ class _DLPAddon:
                     process_name=process_name,
                     hits=hits,
                     text=text,
-                    event_id=payload.request_id,
+                    event_id=event_id,
                     detection_type=(
                         "RULE_BASED" if getattr(self._api, "is_mock", True) else "HYBRID"
                     ),
@@ -410,6 +480,28 @@ class _DLPAddon:
             except Exception:
                 # 로컬 저장소·대시보드 기록 장애는 이미 확정된 HTTP 조치를 바꾸지 않는다.
                 logger.exception("[WebProxy] 분석 결과 기록 실패(판정 유지)")
+
+        try:
+            payload = self._builder.build(text, hits, channel, process_name)
+            event_id = getattr(payload, "request_id", "") or event_id
+            result = self._api.analyze(payload)
+        except Exception as exc:
+            result = AnalysisResult(
+                request_id=event_id,
+                confidence_score=0.0,
+                action="allow",
+                reason=f"웹 업로드 AI 처리 실패: {exc} — Fail-Open 허용",
+                model_version="unavailable",
+                analysis_failed=True,
+            )
+            _record(result)
+            logger.exception("[WebProxy] AI 처리 실패 — ALLOWED Fail-Open 기록")
+            return
+
+        logger.info(
+            "[WebProxy] AI 판단: action=%s confidence=%.2f url=%s",
+            result.action, result.confidence_score, flow.request.pretty_url,
+        )
 
         if result.should_block:
             # 차단 응답을 먼저 확정한다. 이후 팝업이 실패해도 451은 유지된다.

@@ -114,6 +114,7 @@ def test_ai_http_5xx_is_fail_open(monkeypatch):
         [],
         _response_without("event_id"),
         _valid_ai_response(event_id="different-event"),
+        _valid_ai_response(event_id="e" * 121),
         _response_without("decision"),
         _valid_ai_response(decision="unknown"),
         _response_without("confidence_score"),
@@ -121,9 +122,12 @@ def test_ai_http_5xx_is_fail_open(monkeypatch):
         _valid_ai_response(confidence_score=float("nan")),
         _valid_ai_response(confidence_score=1.1),
         _response_without("model_version"),
+        _valid_ai_response(model_version="m" * 101),
         _response_without("latency_ms"),
         _valid_ai_response(latency_ms=-1),
+        _valid_ai_response(latency_ms=600001),
         _valid_ai_response(reason=["invalid"]),
+        _valid_ai_response(reason="r" * 501),
     ],
 )
 def test_invalid_ai_response_is_fail_open(monkeypatch, raw_response):
@@ -163,6 +167,56 @@ def test_response_parser_accepts_complete_valid_contract():
     assert result.confidence_score == 0.12
     assert result.model_version == "koelectra-dlp-v7"
     assert result.latency_ms == 14.5
+
+
+def test_ai_client_sends_configured_bearer_token(monkeypatch):
+    captured = {}
+    response = Mock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = _valid_ai_response()
+
+    def capture_post(*args, **kwargs):
+        captured.update(kwargs)
+        return response
+
+    monkeypatch.setattr("core_comm.api_client.requests.post", capture_post)
+
+    result = ApiClient(
+        "http://ai.example",
+        token="private-ai-token",
+    ).analyze(_analysis_payload())
+
+    assert result.action == "allow"
+    assert captured["headers"] == {
+        "Authorization": "Bearer private-ai-token",
+    }
+
+
+def test_payload_builder_cannot_exceed_ai_request_bounds():
+    text = "x" * 3000 + "secret" + "y" * 3000
+    hits = [
+        {
+            "id": f"pattern-{index}-" + "z" * 120,
+            "name": "test",
+            "severity": "high",
+            "regex": "secret",
+        }
+        for index in range(120)
+    ]
+
+    payload = PayloadBuilder(
+        max_text_chars=0,
+        max_per_pattern=1,
+        context_chars=2500,
+        user_id="u" * 150,
+    ).build(text, hits, "clipboard", "p" * 600)
+    request = payload.to_dict()
+
+    assert len(request["snippet"]) == 4000
+    assert len(request["user_id"]) == 100
+    assert len(request["matched_patterns"]) == 100
+    assert all(1 <= len(item) <= 100 for item in request["matched_patterns"])
+    assert len(request["metadata"]["app"]) == 500
 
 
 @pytest.mark.parametrize(
@@ -332,6 +386,41 @@ def test_dashboard_payload_maps_normal_allow_to_allowed(monkeypatch, tmp_path):
     assert payload["action_taken"] == "ALLOWED"
 
 
+@pytest.mark.parametrize(
+    ("channel", "action"),
+    [("unknown_channel", "allowed"), ("clipboard", "unknown_action")],
+)
+def test_dashboard_payload_rejects_unknown_provenance(
+    monkeypatch,
+    tmp_path,
+    channel,
+    action,
+):
+    monkeypatch.setattr("core_comm.event_logger._get_host_ip", lambda: "127.0.0.1")
+    store = LocalEventStore(tmp_path)
+    event_logger = EventLogger(store)
+
+    with pytest.raises(ValueError, match="지원하지 않는 이벤트"):
+        event_logger._build_log_payload(
+            channel=channel,
+            action=action,
+            process_name="test.exe",
+            hits=[],
+            text=None,
+            extra={"ai_score": 0.0},
+        )
+
+    with pytest.raises(ValueError, match="지원하지 않는 이벤트"):
+        event_logger.log(
+            channel=channel,
+            action=action,
+            process_name="test.exe",
+            hits=[],
+            extra={"ai_score": 0.0},
+        )
+    assert not store._active_path.exists()
+
+
 def test_ai_error_flows_through_event_record_to_dashboard_payload(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "core_comm.api_client.requests.post",
@@ -357,6 +446,7 @@ def test_ai_error_flows_through_event_record_to_dashboard_payload(monkeypatch, t
     dashboard_payload = event_logger._build_log_payload_from_record(record)
     assert dashboard_payload["action_taken"] == "ALLOWED"
     assert dashboard_payload["model_version"] == "unavailable"
+    assert dashboard_payload["detection_type"] == "RULE_BASED"
     assert dashboard_payload["event_id"] == analysis_payload.request_id
     assert "connection refused" in dashboard_payload["decision_reason"]
     assert "Fail-Open 허용" in dashboard_payload["decision_reason"]
@@ -513,6 +603,13 @@ def test_clipboard_worker_exceptions_attempt_release_exactly_once(failure_stage)
     )
 
     release.assert_called_once_with()
+    if failure_stage in {"build", "analyze"}:
+        event_logger.log.assert_called_once()
+        logged = event_logger.log.call_args.kwargs
+        assert logged["action"] == "allowed"
+        assert logged["extra"]["model_version"] == "unavailable"
+        assert logged["extra"]["detection_type"] == "RULE_BASED"
+        assert logged["extra"]["event_id"]
 
 
 @pytest.mark.parametrize("failure_stage", ["event_log", "block_notify"])
@@ -590,6 +687,7 @@ def test_network_handler_pipeline_exception_is_recorded_fail_open(failure_stage)
     logged = event_logger.log.call_args.kwargs
     assert logged["action"] == "allowed"
     assert logged["extra"]["model_version"] == "unavailable"
+    assert logged["extra"]["detection_type"] == "RULE_BASED"
     assert logged["extra"]["event_id"]
     assert "Fail-Open 허용" in logged["extra"]["reason"]
 
@@ -1083,6 +1181,90 @@ def test_web_decision_survives_event_and_notifier_failures(
     assert actual_status == expected_status
 
 
+@pytest.mark.parametrize("failure_stage", ["build", "analyze"])
+def test_web_ai_pipeline_failure_is_recorded_fail_open(monkeypatch, failure_stage):
+    _install_fake_mitmproxy_response(monkeypatch)
+    builder = Mock()
+    builder.build.return_value = SimpleNamespace(request_id="web-fail-open-1")
+    api_client = SimpleNamespace(is_mock=False, analyze=Mock())
+    if failure_stage == "build":
+        builder.build.side_effect = RuntimeError("payload failed")
+    else:
+        api_client.analyze.side_effect = RuntimeError("analysis failed")
+    event_logger = Mock()
+    addon = _DLPAddon(
+        inspect_domains=["mail.example"],
+        rule_filter=SimpleNamespace(match=lambda text: [{"id": "rrn"}]),
+        payload_builder=builder,
+        api_client=api_client,
+        event_logger=event_logger,
+        file_inspector=Mock(),
+        log_traffic=False,
+    )
+    monkeypatch.setattr(addon, "_get_dlp_channel", lambda flow: "web_mail")
+    monkeypatch.setattr(addon, "_extract_text", lambda flow: "sensitive content")
+    flow = _web_flow()
+
+    addon._handle(flow)
+
+    assert flow.response is None
+    event_logger.log.assert_called_once()
+    logged = event_logger.log.call_args.kwargs
+    assert logged["action"] == "allowed"
+    assert logged["extra"]["event_id"]
+    assert logged["extra"]["model_version"] == "unavailable"
+    assert logged["extra"]["detection_type"] == "RULE_BASED"
+    assert "Fail-Open 허용" in logged["extra"]["reason"]
+
+
+@pytest.mark.parametrize("failure_stage", ["channel", "extract", "rules"])
+def test_web_pre_ai_pipeline_failure_is_recorded_fail_open(monkeypatch, failure_stage):
+    _install_fake_mitmproxy_response(monkeypatch)
+    rule_filter = Mock()
+    rule_filter.match.return_value = [{"id": "rrn"}]
+    event_logger = Mock()
+    addon = _DLPAddon(
+        inspect_domains=["mail.example"],
+        rule_filter=rule_filter,
+        payload_builder=Mock(),
+        api_client=SimpleNamespace(is_mock=False),
+        event_logger=event_logger,
+        file_inspector=Mock(),
+        log_traffic=False,
+    )
+    flow = _web_flow()
+
+    if failure_stage == "channel":
+        monkeypatch.setattr(
+            addon,
+            "_get_dlp_channel",
+            Mock(side_effect=RuntimeError("classifier detail must stay internal")),
+        )
+    else:
+        monkeypatch.setattr(addon, "_get_dlp_channel", lambda candidate: "web_mail")
+        if failure_stage == "extract":
+            monkeypatch.setattr(
+                addon,
+                "_extract_text",
+                Mock(side_effect=RuntimeError("extractor detail must stay internal")),
+            )
+        else:
+            monkeypatch.setattr(addon, "_extract_text", lambda candidate: "sensitive")
+            rule_filter.match.side_effect = RuntimeError("rule detail must stay internal")
+
+    addon.request(flow)
+
+    assert flow.response is None
+    event_logger.log.assert_called_once()
+    logged = event_logger.log.call_args.kwargs
+    assert logged["action"] == "allowed"
+    assert logged["extra"]["event_id"]
+    assert logged["extra"]["model_version"] == "unavailable"
+    assert logged["extra"]["detection_type"] == "RULE_BASED"
+    assert "Fail-Open 허용" in logged["extra"]["reason"]
+    assert "must stay internal" not in logged["extra"]["reason"]
+
+
 def test_web_block_response_failure_is_recorded_as_warned(monkeypatch):
     class FailingResponse:
         @staticmethod
@@ -1138,6 +1320,13 @@ def _load_usb_guard_with_win32_stubs(monkeypatch):
     win32file = ModuleType("win32file")
     win32con.DRIVE_REMOVABLE = 2
     win32con.DRIVE_FIXED = 3
+    win32con.GENERIC_READ = 0x80000000
+    win32con.FILE_SHARE_READ = 1
+    win32con.OPEN_EXISTING = 3
+    win32con.FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    win32con.FILE_ATTRIBUTE_DIRECTORY = 0x10
+    win32con.FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+    win32file.FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
     monkeypatch.setitem(sys.modules, "win32api", win32api)
     monkeypatch.setitem(sys.modules, "win32con", win32con)
     monkeypatch.setitem(sys.modules, "win32file", win32file)
@@ -1156,6 +1345,134 @@ def _load_usb_guard_with_win32_stubs(monkeypatch):
 
 _USB_ANALYSIS_FINGERPRINT = (128, 2, 12, 22, 32)
 _USB_CHANGED_FINGERPRINT = (128, 2, 12, 22, 33)
+_USB_VOLUME_SERIAL = 0x1234
+_USB_HANDLE_FINGERPRINT = (0, _USB_VOLUME_SERIAL, 77, 128, 100, 200)
+_USB_CHANGED_HANDLE_FINGERPRINT = (0, _USB_VOLUME_SERIAL, 77, 128, 100, 201)
+
+
+class _UsbFakeHandle:
+    def __init__(self, call_order=None, close_error=None, value=91):
+        self.call_order = call_order if call_order is not None else []
+        self.close_error = close_error
+        self.close_calls = 0
+        self.value = value
+
+    def Close(self):
+        self.call_order.append("close")
+        self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
+
+    def __int__(self):
+        return self.value
+
+
+def _usb_guard_for_decision(
+    monkeypatch,
+    usb_guard,
+    *,
+    decision="block",
+    final_handle_fingerprint=_USB_HANDLE_FINGERPRINT,
+    disposition_error=None,
+    close_error=None,
+    payload_error=None,
+    event_error=None,
+):
+    call_order = []
+    handle = _UsbFakeHandle(call_order, close_error)
+    monkeypatch.setattr(
+        usb_guard,
+        "_wait_for_stable_file",
+        lambda path: _USB_ANALYSIS_FINGERPRINT,
+    )
+    monkeypatch.setattr(
+        usb_guard,
+        "_read_file_fingerprint",
+        Mock(return_value=_USB_ANALYSIS_FINGERPRINT),
+    )
+    monkeypatch.setattr(usb_guard, "_open_file_handle", Mock(return_value=handle))
+
+    handle_states = iter([_USB_HANDLE_FINGERPRINT, final_handle_fingerprint])
+
+    def read_handle_fingerprint(candidate):
+        call_order.append("handle_fingerprint")
+        state = next(handle_states)
+        if isinstance(state, BaseException):
+            raise state
+        return state
+
+    handle_fingerprint = Mock(side_effect=read_handle_fingerprint)
+    monkeypatch.setattr(usb_guard, "_handle_fingerprint", handle_fingerprint)
+    read_handle = Mock(return_value=b"sensitive bytes")
+    monkeypatch.setattr(usb_guard, "_read_handle_bytes", read_handle)
+
+    def mark_delete(candidate):
+        call_order.append("disposition")
+        if disposition_error is not None:
+            raise disposition_error
+
+    disposition = Mock(side_effect=mark_delete)
+    monkeypatch.setattr(usb_guard, "_mark_delete_on_close", disposition)
+    review_notice = Mock(side_effect=RuntimeError("review popup unavailable"))
+    monkeypatch.setattr(usb_guard, "notify_review", review_notice)
+
+    file_inspector = Mock()
+    file_inspector.extract_from_bytes.return_value = (
+        "sensitive content long enough for inspection"
+    )
+    payload_builder = Mock()
+    if payload_error is None:
+        payload_builder.build.return_value = SimpleNamespace(
+            request_id="usb-decision-1"
+        )
+    else:
+        payload_builder.build.side_effect = payload_error
+    api_client = SimpleNamespace(
+        is_mock=False,
+        analyze=Mock(
+            return_value=AnalysisResult(
+                request_id="usb-decision-1",
+                confidence_score=0.9 if decision == "block" else 0.3,
+                action=decision,
+                reason="contract decision",
+                model_version="koelectra-dlp-v7",
+            )
+        ),
+    )
+    event_logger = Mock()
+
+    def log_event(**kwargs):
+        call_order.append("log")
+        if event_error is not None:
+            raise event_error
+
+    event_logger.log.side_effect = log_event
+    blocked_notice = Mock(side_effect=RuntimeError("blocked popup unavailable"))
+
+    guard = usb_guard.UsbGuardUserMode.__new__(usb_guard.UsbGuardUserMode)
+    guard._lock = usb_guard.threading.Lock()
+    guard._inflight_paths = set()
+    guard._max_size = 1024
+    guard._fi = file_inspector
+    guard._rf = SimpleNamespace(match=lambda text: [{"id": "rrn"}])
+    guard._pb = payload_builder
+    guard._ac = api_client
+    guard._el = event_logger
+    guard._on_blocked = blocked_notice
+
+    return SimpleNamespace(
+        guard=guard,
+        handle=handle,
+        handle_fingerprint=handle_fingerprint,
+        read_handle=read_handle,
+        disposition=disposition,
+        review_notice=review_notice,
+        blocked_notice=blocked_notice,
+        event_logger=event_logger,
+        file_inspector=file_inspector,
+        api_client=api_client,
+        call_order=call_order,
+    )
 
 
 def test_usb_file_stability_waits_for_unchanged_size_and_mtime(monkeypatch):
@@ -1238,15 +1555,44 @@ def test_usb_file_stability_timeout_is_finite(monkeypatch, caplog):
 def test_usb_unstable_file_is_not_inspected_or_deleted(monkeypatch):
     usb_guard = _load_usb_guard_with_win32_stubs(monkeypatch)
     monkeypatch.setattr(usb_guard, "_wait_for_stable_file", lambda path: None)
-    remove = Mock()
-    monkeypatch.setattr(usb_guard.os, "remove", remove)
+    open_handle = Mock()
+    monkeypatch.setattr(usb_guard, "_open_file_handle", open_handle)
 
     guard = usb_guard.UsbGuardUserMode.__new__(usb_guard.UsbGuardUserMode)
     guard._fi = Mock()
-    guard._inspect_stable_file("E:\\sensitive.txt", "E:")
+    guard._inspect_stable_file(
+        "E:\\sensitive.txt",
+        "E:",
+        _USB_VOLUME_SERIAL,
+    )
 
-    guard._fi.extract_from_path.assert_not_called()
-    remove.assert_not_called()
+    guard._fi.extract_from_bytes.assert_not_called()
+    open_handle.assert_not_called()
+
+
+def test_usb_payload_failure_has_stable_fail_open_event_id(monkeypatch):
+    usb_guard = _load_usb_guard_with_win32_stubs(monkeypatch)
+    state = _usb_guard_for_decision(
+        monkeypatch,
+        usb_guard,
+        decision="allow",
+        payload_error=RuntimeError("payload failed"),
+    )
+
+    state.guard._inspect_file(
+        "E:\\sensitive.txt",
+        "E:",
+        _USB_VOLUME_SERIAL,
+    )
+
+    state.event_logger.log.assert_called_once()
+    logged = state.event_logger.log.call_args.kwargs
+    assert logged["action"] == "allowed"
+    assert logged["extra"]["event_id"]
+    assert logged["extra"]["model_version"] == "unavailable"
+    assert logged["extra"]["detection_type"] == "RULE_BASED"
+    assert state.handle.close_calls == 1
+    state.disposition.assert_not_called()
 
 
 def test_usb_file_inspection_deduplicates_inflight_path(monkeypatch):
@@ -1254,7 +1600,8 @@ def test_usb_file_inspection_deduplicates_inflight_path(monkeypatch):
     started = usb_guard.threading.Event()
     release = usb_guard.threading.Event()
 
-    def inspect_once(file_path, drive):
+    def inspect_once(file_path, drive, volume_serial):
+        assert volume_serial == _USB_VOLUME_SERIAL
         started.set()
         assert release.wait(1.0)
 
@@ -1265,177 +1612,177 @@ def test_usb_file_inspection_deduplicates_inflight_path(monkeypatch):
 
     worker = usb_guard.threading.Thread(
         target=guard._inspect_file,
-        args=("E:\\sensitive.txt", "E:"),
+        args=("E:\\sensitive.txt", "E:", _USB_VOLUME_SERIAL),
     )
     worker.start()
     assert started.wait(1.0)
 
-    guard._inspect_file("E:\\sensitive.txt", "E:")
+    guard._inspect_file("E:\\sensitive.txt", "E:", _USB_VOLUME_SERIAL)
     assert guard._inspect_stable_file.call_count == 1
 
     release.set()
     worker.join(1.0)
     assert not worker.is_alive()
 
-    guard._inspect_file("E:\\sensitive.txt", "E:")
+    guard._inspect_file("E:\\sensitive.txt", "E:", _USB_VOLUME_SERIAL)
     assert guard._inspect_stable_file.call_count == 2
 
 
 @pytest.mark.parametrize(
     (
         "decision",
-        "delete_state",
-        "remove_error",
-        "expected_remove_count",
+        "final_handle_fingerprint",
+        "disposition_error",
+        "close_error",
+        "expected_disposition_count",
         "expected_log_action",
         "expected_blocked_notices",
         "expected_review_notices",
         "expected_failure_reason",
     ),
     [
-        ("block", _USB_ANALYSIS_FINGERPRINT, None, 1, "blocked", 1, 0, None),
         (
             "block",
-            _USB_ANALYSIS_FINGERPRINT,
-            FileNotFoundError("already absent"),
+            _USB_HANDLE_FINGERPRINT,
+            None,
+            None,
             1,
-            "review",
+            "blocked",
+            1,
             0,
-            1,
-            "삭제 중 파일 없음",
+            None,
         ),
         (
             "block",
-            _USB_ANALYSIS_FINGERPRINT,
+            _USB_HANDLE_FINGERPRINT,
             PermissionError("file locked"),
+            None,
             1,
             "review",
             0,
             1,
-            "USB 파일 삭제 실패",
+            "USB 파일 삭제 예약 실패",
         ),
         (
             "block",
-            _USB_CHANGED_FINGERPRINT,
+            _USB_CHANGED_HANDLE_FINGERPRINT,
+            None,
             None,
             0,
             "review",
             0,
             1,
-            "파일 변경 감지",
+            "핸들 지문 변경 감지",
         ),
         (
             "block",
-            FileNotFoundError("gone before delete"),
+            OSError("fingerprint failed"),
+            None,
             None,
             0,
             "review",
             0,
             1,
-            "삭제 직전 파일 없음",
+            "삭제 예약 실패",
         ),
         (
             "block",
-            PermissionError("cannot stat"),
+            _USB_HANDLE_FINGERPRINT,
+            None,
+            OSError("close failed"),
+            1,
+            "review",
+            0,
+            1,
+            "핸들 닫기 실패",
+        ),
+        (
+            "review",
+            _USB_HANDLE_FINGERPRINT,
+            None,
             None,
             0,
             "review",
             0,
             1,
-            "USB 파일 상태 확인 실패",
+            None,
         ),
-        ("review", _USB_ANALYSIS_FINGERPRINT, None, 0, "review", 0, 1, None),
-        ("allow", _USB_ANALYSIS_FINGERPRINT, None, 0, "allowed", 0, 0, None),
+        (
+            "allow",
+            _USB_HANDLE_FINGERPRINT,
+            None,
+            None,
+            0,
+            "allowed",
+            0,
+            0,
+            None,
+        ),
+        (
+            "allow",
+            _USB_HANDLE_FINGERPRINT,
+            None,
+            OSError("close failed"),
+            0,
+            "review",
+            0,
+            1,
+            "핸들 해제 상태 미확인",
+        ),
     ],
 )
 def test_usb_file_action_survives_event_and_notifier_failures(
     monkeypatch,
     decision,
-    delete_state,
-    remove_error,
-    expected_remove_count,
+    final_handle_fingerprint,
+    disposition_error,
+    close_error,
+    expected_disposition_count,
     expected_log_action,
     expected_blocked_notices,
     expected_review_notices,
     expected_failure_reason,
 ):
     usb_guard = _load_usb_guard_with_win32_stubs(monkeypatch)
-    monkeypatch.setattr(
+    state = _usb_guard_for_decision(
+        monkeypatch,
         usb_guard,
-        "_wait_for_stable_file",
-        lambda path: _USB_ANALYSIS_FINGERPRINT,
+        decision=decision,
+        final_handle_fingerprint=final_handle_fingerprint,
+        disposition_error=disposition_error,
+        close_error=close_error,
+        event_error=RuntimeError("event store unavailable"),
     )
-    monkeypatch.setattr(usb_guard.os.path, "isfile", lambda path: True)
-    call_order = []
 
-    def read_delete_fingerprint(path):
-        call_order.append("fingerprint")
-        if isinstance(delete_state, BaseException):
-            raise delete_state
-        return delete_state
-
-    fingerprint = Mock(side_effect=read_delete_fingerprint)
-    monkeypatch.setattr(usb_guard, "_read_file_fingerprint", fingerprint)
-
-    def remove_file(path):
-        call_order.append("remove")
-        if remove_error:
-            raise remove_error
-
-    remove = Mock(side_effect=remove_file)
-    monkeypatch.setattr(usb_guard.os, "remove", remove)
-    review_notice = Mock(side_effect=RuntimeError("review popup unavailable"))
-    monkeypatch.setattr(usb_guard, "notify_review", review_notice)
-
-    event_logger = Mock()
-
-    def fail_event_log(**kwargs):
-        call_order.append("log")
-        raise RuntimeError("event store unavailable")
-
-    event_logger.log.side_effect = fail_event_log
-    blocked_notice = Mock(side_effect=RuntimeError("blocked popup unavailable"))
-    guard = usb_guard.UsbGuardUserMode.__new__(usb_guard.UsbGuardUserMode)
-    guard._lock = usb_guard.threading.Lock()
-    guard._inflight_paths = set()
-    guard._max_size = 1024
-    guard._fi = SimpleNamespace(
-        extract_from_path=lambda path: "sensitive content long enough for inspection"
+    state.guard._inspect_file(
+        "E:\\sensitive.txt",
+        "E:",
+        _USB_VOLUME_SERIAL,
     )
-    guard._rf = SimpleNamespace(match=lambda text: [{"id": "rrn"}])
-    guard._pb = SimpleNamespace(
-        build=lambda **kwargs: SimpleNamespace(request_id="usb-decision-1")
-    )
-    guard._ac = SimpleNamespace(
-        is_mock=False,
-        analyze=lambda payload: AnalysisResult(
-            request_id=payload.request_id,
-            confidence_score=0.9 if decision == "block" else 0.3,
-            action=decision,
-            reason="contract decision",
-            model_version="koelectra-dlp-v7",
-        ),
-    )
-    guard._el = event_logger
-    guard._on_blocked = blocked_notice
 
-    guard._inspect_file("E:\\sensitive.txt", "E:")
-
-    assert remove.call_count == expected_remove_count
-    assert event_logger.log.call_count == 1
-    assert event_logger.log.call_args.kwargs["action"] == expected_log_action
-    assert blocked_notice.call_count == expected_blocked_notices
-    assert review_notice.call_count == expected_review_notices
+    assert state.disposition.call_count == expected_disposition_count
+    assert state.handle.close_calls == 1
+    assert state.event_logger.log.call_count == 1
+    assert state.event_logger.log.call_args.kwargs["action"] == expected_log_action
+    assert state.blocked_notice.call_count == expected_blocked_notices
+    assert state.review_notice.call_count == expected_review_notices
+    state.file_inspector.extract_from_bytes.assert_called_once_with(
+        b"sensitive bytes",
+        "sensitive.txt",
+    )
+    assert state.call_order.index("close") < state.call_order.index("log")
     if decision == "block":
-        fingerprint.assert_called_once_with("E:\\sensitive.txt")
-        assert call_order.index("fingerprint") < call_order.index("log")
-        if expected_remove_count:
-            assert call_order.index("fingerprint") < call_order.index("remove")
-            assert call_order.index("remove") < call_order.index("log")
+        assert state.handle_fingerprint.call_count == 2
+        if expected_disposition_count:
+            assert state.call_order.index("handle_fingerprint") < state.call_order.index(
+                "disposition"
+            )
+            assert state.call_order.index("disposition") < state.call_order.index("close")
     else:
-        fingerprint.assert_not_called()
+        state.disposition.assert_not_called()
+        assert state.handle_fingerprint.call_count == 1
 
-    extra = event_logger.log.call_args.kwargs["extra"]
+    extra = state.event_logger.log.call_args.kwargs["extra"]
     assert extra["event_id"] == "usb-decision-1"
     assert extra["model_version"] == "koelectra-dlp-v7"
     if expected_log_action == "review" and decision == "block":
@@ -1443,8 +1790,204 @@ def test_usb_file_action_survives_event_and_notifier_failures(
         assert "실제 차단 미확인" in extra["reason"]
     if expected_failure_reason:
         assert expected_failure_reason in extra["reason"]
-    if isinstance(remove_error, FileNotFoundError) or isinstance(
-        delete_state,
-        FileNotFoundError,
-    ):
-        assert "파일 삭제 확인 불가" in extra["reason"]
+
+
+@pytest.mark.parametrize(
+    ("attributes", "expected_volume", "path_fingerprint", "handle_error"),
+    [
+        (0x10, _USB_VOLUME_SERIAL, _USB_ANALYSIS_FINGERPRINT, None),
+        (0x400, _USB_VOLUME_SERIAL, _USB_ANALYSIS_FINGERPRINT, None),
+        (0, _USB_VOLUME_SERIAL + 1, _USB_ANALYSIS_FINGERPRINT, None),
+        (0, _USB_VOLUME_SERIAL, _USB_CHANGED_FINGERPRINT, None),
+        (0, _USB_VOLUME_SERIAL, _USB_ANALYSIS_FINGERPRINT, OSError("info failed")),
+    ],
+)
+def test_usb_unsafe_handle_target_aborts_before_content_or_ai(
+    monkeypatch,
+    attributes,
+    expected_volume,
+    path_fingerprint,
+    handle_error,
+):
+    usb_guard = _load_usb_guard_with_win32_stubs(monkeypatch)
+    handle = _UsbFakeHandle()
+    monkeypatch.setattr(
+        usb_guard,
+        "_wait_for_stable_file",
+        lambda path: _USB_ANALYSIS_FINGERPRINT,
+    )
+    monkeypatch.setattr(usb_guard, "_open_file_handle", Mock(return_value=handle))
+    if handle_error is not None:
+        monkeypatch.setattr(
+            usb_guard,
+            "_handle_fingerprint",
+            Mock(side_effect=handle_error),
+        )
+    else:
+        monkeypatch.setattr(
+            usb_guard,
+            "_handle_fingerprint",
+            Mock(
+                return_value=(
+                    attributes,
+                    _USB_VOLUME_SERIAL,
+                    77,
+                    128,
+                    100,
+                    200,
+                )
+            ),
+        )
+    monkeypatch.setattr(
+        usb_guard,
+        "_read_file_fingerprint",
+        Mock(return_value=path_fingerprint),
+    )
+    read_handle = Mock()
+    monkeypatch.setattr(usb_guard, "_read_handle_bytes", read_handle)
+    disposition = Mock()
+    monkeypatch.setattr(usb_guard, "_mark_delete_on_close", disposition)
+
+    guard = usb_guard.UsbGuardUserMode.__new__(usb_guard.UsbGuardUserMode)
+    guard._max_size = 1024
+    guard._fi = Mock()
+    guard._rf = Mock()
+    guard._pb = Mock()
+    guard._ac = Mock()
+    guard._el = Mock()
+    guard._on_blocked = Mock()
+
+    guard._inspect_stable_file(
+        "E:\\sensitive.txt",
+        "E:",
+        expected_volume,
+    )
+
+    assert handle.close_calls == 1
+    read_handle.assert_not_called()
+    guard._fi.extract_from_bytes.assert_not_called()
+    guard._ac.analyze.assert_not_called()
+    disposition.assert_not_called()
+    guard._el.log.assert_not_called()
+
+
+def test_usb_open_handle_denies_write_and_delete_sharing(monkeypatch):
+    usb_guard = _load_usb_guard_with_win32_stubs(monkeypatch)
+    handle = _UsbFakeHandle()
+    create_file = Mock(return_value=handle)
+    usb_guard.win32file.CreateFile = create_file
+
+    assert usb_guard._open_file_handle("E:\\sensitive.txt") is handle
+
+    args = create_file.call_args.args
+    assert args[1] == usb_guard.win32con.GENERIC_READ | usb_guard._DELETE_ACCESS
+    assert args[2] == usb_guard.win32con.FILE_SHARE_READ
+    assert args[5] == (
+        usb_guard.win32file.FILE_FLAG_OPEN_REPARSE_POINT
+        | usb_guard.win32con.FILE_FLAG_BACKUP_SEMANTICS
+    )
+
+
+def test_usb_handle_information_uses_win32_identity_fields(monkeypatch):
+    usb_guard = _load_usb_guard_with_win32_stubs(monkeypatch)
+    handle = _UsbFakeHandle()
+    usb_guard.win32file.GetFileInformationByHandle = Mock(
+        return_value=(
+            0x20,
+            100,
+            110,
+            120,
+            _USB_VOLUME_SERIAL,
+            0,
+            128,
+            1,
+            0,
+            77,
+        )
+    )
+
+    assert usb_guard._handle_volume_serial(handle) == _USB_VOLUME_SERIAL
+    assert usb_guard._handle_fingerprint(handle) == (
+        0x20,
+        _USB_VOLUME_SERIAL,
+        77,
+        128,
+        100,
+        120,
+    )
+
+
+def test_usb_reads_exact_bytes_from_one_handle(monkeypatch):
+    usb_guard = _load_usb_guard_with_win32_stubs(monkeypatch)
+    handle = _UsbFakeHandle()
+    usb_guard.win32file.SetFilePointer = Mock()
+    usb_guard.win32file.ReadFile = Mock(
+        side_effect=[(0, b"abc"), (0, b"def")]
+    )
+
+    assert usb_guard._read_handle_bytes(handle, 6) == b"abcdef"
+    usb_guard.win32file.SetFilePointer.assert_called_once_with(handle, 0, 0)
+    assert usb_guard.win32file.ReadFile.call_count == 2
+
+
+def test_usb_short_handle_read_fails_closed_before_analysis(monkeypatch):
+    usb_guard = _load_usb_guard_with_win32_stubs(monkeypatch)
+    handle = _UsbFakeHandle()
+    usb_guard.win32file.SetFilePointer = Mock()
+    usb_guard.win32file.ReadFile = Mock(side_effect=[(0, b"abc"), (0, b"")])
+
+    with pytest.raises(OSError, match="EOF"):
+        usb_guard._read_handle_bytes(handle, 6)
+
+
+@pytest.mark.parametrize("api_result", [1, 0])
+def test_usb_file_disposition_info_ctypes_contract(monkeypatch, api_result):
+    usb_guard = _load_usb_guard_with_win32_stubs(monkeypatch)
+    captured = {}
+
+    class FakeSetFileInformation:
+        def __call__(self, handle, info_class, info_pointer, info_size):
+            captured["handle"] = handle.value
+            captured["class"] = info_class
+            captured["delete_file"] = usb_guard.ctypes.cast(
+                info_pointer,
+                usb_guard.ctypes.POINTER(usb_guard._FileDispositionInfo),
+            ).contents.delete_file
+            captured["size"] = info_size
+            return api_result
+
+    fake_api = FakeSetFileInformation()
+    kernel32 = SimpleNamespace(SetFileInformationByHandle=fake_api)
+    monkeypatch.setattr(
+        usb_guard.ctypes,
+        "WinDLL",
+        lambda name, use_last_error: kernel32,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        usb_guard.ctypes,
+        "get_last_error",
+        lambda: 5,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        usb_guard.ctypes,
+        "FormatError",
+        lambda error: "access denied",
+        raising=False,
+    )
+    handle = _UsbFakeHandle(value=123)
+
+    if api_result:
+        usb_guard._mark_delete_on_close(handle)
+    else:
+        with pytest.raises(OSError) as exc_info:
+            usb_guard._mark_delete_on_close(handle)
+        assert exc_info.value.errno == 5
+
+    assert captured == {
+        "handle": 123,
+        "class": 4,
+        "delete_file": 1,
+        "size": usb_guard.ctypes.sizeof(usb_guard._FileDispositionInfo),
+    }

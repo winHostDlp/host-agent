@@ -80,9 +80,11 @@ class ApiClient:
         self,
         base_url: str = "",
         timeout: float = 10.0,
+        token: str | None = "",
     ) -> None:
         self._base_url = base_url.rstrip("/") if base_url else ""
         self._timeout  = timeout
+        self._token    = token.strip() if isinstance(token, str) else ""
         self._mock     = not bool(self._base_url)
 
         if self._mock:
@@ -111,9 +113,15 @@ class ApiClient:
         logger.debug("AI 서버 요청 → %s (event_id=%s)", url, payload.request_id)
 
         try:
+            headers = (
+                {"Authorization": f"Bearer {self._token}"}
+                if self._token
+                else None
+            )
             resp = requests.post(
                 url,
                 json=payload.to_dict(),   # AgentRequest 포맷
+                headers=headers,
                 timeout=self._timeout,
             )
             resp.raise_for_status()

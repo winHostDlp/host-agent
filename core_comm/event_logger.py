@@ -77,6 +77,18 @@ _ACTION_TO_TAKEN: dict[str, str] = {
 }
 
 
+def _map_event_provenance(channel: str, action: str) -> tuple[str, str]:
+    try:
+        leak_channel = _CHANNEL_TO_LEAK[channel]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"지원하지 않는 이벤트 채널: {channel!r}") from exc
+    try:
+        action_taken = _ACTION_TO_TAKEN[action.lower()]
+    except (AttributeError, KeyError) as exc:
+        raise ValueError(f"지원하지 않는 이벤트 조치: {action!r}") from exc
+    return leak_channel, action_taken
+
+
 def _resolve_file_name(channel: str, process_name: str, extra: dict[str, Any]) -> str:
     """채널별 file_name 결정 (대시보드 required 필드 — 최소 1자)."""
     if channel in ("file_guard", "usb"):
@@ -159,6 +171,9 @@ class EventLogger:
         extra: Optional[dict[str, Any]] = None,
     ) -> None:
         """이벤트를 로컬에 저장하고, 즉시 전송 모드면 비동기로 서버에도 보낸다."""
+        # 잘못된 provenance가 JSONL에 영구히 남아 flush마다 실패하지 않게
+        # 로컬 파일을 쓰기 전에 검증한다.
+        _map_event_provenance(channel, action)
         self._store.write(
             channel=channel,
             action=action,
@@ -223,8 +238,7 @@ class EventLogger:
         """LogCreate 포맷의 대시보드 페이로드를 구성한다."""
         extra = extra or {}
 
-        leak_channel  = _CHANNEL_TO_LEAK.get(channel, "MESSENGER")
-        action_taken  = _ACTION_TO_TAKEN.get(action.lower(), "BLOCKED")
+        leak_channel, action_taken = _map_event_provenance(channel, action)
 
         # ai_score: extra에 0-1 스케일 ai_score 또는 0-100 risk_score 사용
         if "ai_score" in extra:
@@ -253,7 +267,7 @@ class EventLogger:
         return {
             "event_id":        extra.get("event_id") or str(uuid.uuid4()),
             "agent_id":        self._agent_id,
-            "timestamp":       datetime.now(timezone.utc).isoformat(),
+            "timestamp":       extra.get("_event_timestamp") or datetime.now(timezone.utc).isoformat(),
             "host_ip":         self._host_ip,
             "hostname":        _HOSTNAME,
             "user_id":         self._user_id,
@@ -278,10 +292,11 @@ class EventLogger:
         hits  = record.get("hits", [])
         extra = record.get("extra") or {}
         extra.setdefault("event_id", record.get("event_id"))
+        extra.setdefault("_event_timestamp", record.get("timestamp"))
 
         return self._build_log_payload(
-            channel=record.get("channel", "clipboard"),
-            action=record.get("action", "blocked"),
+            channel=record["channel"],
+            action=record["action"],
             process_name=record.get("process", ""),
             hits=hits,
             text=record.get("text_preview"),

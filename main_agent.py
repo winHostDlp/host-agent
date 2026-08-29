@@ -51,7 +51,29 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 def load_settings() -> dict[str, Any]:
     path = PROJECT_ROOT / "config" / "settings.yaml"
     with path.open(encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        settings = yaml.safe_load(f)
+    if not isinstance(settings, dict):
+        raise ValueError("config/settings.yaml은 mapping이어야 합니다.")
+
+    local_path = PROJECT_ROOT / "config" / "settings.local.yaml"
+    if local_path.exists():
+        with local_path.open(encoding="utf-8") as f:
+            local_settings = yaml.safe_load(f)
+        if not isinstance(local_settings, dict):
+            raise ValueError("config/settings.local.yaml은 mapping이어야 합니다.")
+        settings = _merge_settings(settings, local_settings)
+    return settings
+
+
+def _merge_settings(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Merge an ignored local settings file without mutating tracked defaults."""
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_settings(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def load_channel_policy() -> dict[str, Any]:
@@ -74,6 +96,7 @@ def build_api_client(settings: dict[str, Any]) -> ApiClient:
     return ApiClient(
         base_url=server_cfg.get("ai_base_url", ""),
         timeout=server_cfg.get("request_timeout_sec", 10),
+        token=os.environ.get("AI_API_TOKEN") or server_cfg.get("ai_token", ""),
     )
 
 
@@ -81,7 +104,7 @@ def build_payload_builder(settings: dict[str, Any]) -> PayloadBuilder:
     agent_cfg = settings.get("agent", {})
     user_id   = agent_cfg.get("user_id") or os.environ.get("USERNAME", "")
     return PayloadBuilder(
-        max_text_chars=agent_cfg.get("ai_max_text_chars", 0),
+        max_text_chars=agent_cfg.get("ai_max_text_chars", 4000),
         max_per_pattern=agent_cfg.get("ai_max_matches_per_pattern", 10),
         context_chars=agent_cfg.get("ai_context_chars", 200),
         user_id=user_id,
@@ -106,7 +129,10 @@ def build_event_logger(settings: dict[str, Any]) -> EventLogger:
     return EventLogger(
         store=store,
         dashboard_url=dashboard_url,
-        dashboard_token=server_cfg.get("dashboard_token", ""),
+        dashboard_token=(
+            os.environ.get("AGENT_API_TOKEN")
+            or server_cfg.get("dashboard_token", "")
+        ),
         timeout=server_cfg.get("request_timeout_sec", 10),
         send_immediately=send_now,
         agent_id=agent_cfg.get("agent_id", ""),
