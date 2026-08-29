@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 
+import core_comm.event_logger as event_logger_module
 from core_comm.event_logger import EventLogger
 from core_comm.local_store import LocalEventStore
 from scripts import flush_dashboard_logs
@@ -304,6 +305,124 @@ def test_post_logs_valid_dashboard_receipt(
         assert event_logger._post({"event_id": "receipt-event"}) is True
 
     assert "event_id=receipt-event log_id=1 duplicate=False" in caplog.text
+
+
+@pytest.mark.parametrize("mode", ["user", "system", "all"])
+def test_heartbeat_posts_only_process_identity_and_accepts_matching_receipt(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    token = "heartbeat-secret-token"
+    event_logger = EventLogger(
+        store=LocalEventStore(tmp_path),
+        dashboard_url="https://dashboard.test/",
+        dashboard_token=token,
+        timeout=3,
+        agent_id="demo-agent",
+    )
+    captured: dict[str, Any] = {}
+
+    def capture_post(url: str, **kwargs: Any) -> _Response:
+        captured.update(url=url, **kwargs)
+        return _Response(
+            body={
+                "status": "ok",
+                "agent_id": "demo-agent",
+                "mode": mode,
+                "last_seen_at": "2026-08-29T05:30:00+00:00",
+            }
+        )
+
+    monkeypatch.setattr(event_logger_module.requests, "post", capture_post)
+
+    assert event_logger.send_heartbeat(mode, "0.1.0") is True
+    assert captured == {
+        "url": "https://dashboard.test/api/v1/agents/heartbeat",
+        "json": {
+            "agent_id": "demo-agent",
+            "hostname": event_logger_module._HOSTNAME,
+            "agent_version": "0.1.0",
+            "mode": mode,
+        },
+        "headers": {
+            "Content-Type": "application/json",
+            "X-Agent-Token": token,
+        },
+        "timeout": 3,
+    }
+    assert token not in json.dumps(captured["json"])
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        None,
+        {
+            "status": "stored",
+            "agent_id": "demo-agent",
+            "mode": "user",
+            "last_seen_at": "2026-08-29T05:30:00+00:00",
+        },
+        {
+            "status": "ok",
+            "agent_id": "other-agent",
+            "mode": "user",
+            "last_seen_at": "2026-08-29T05:30:00+00:00",
+        },
+        {
+            "status": "ok",
+            "agent_id": "demo-agent",
+            "mode": "system",
+            "last_seen_at": "2026-08-29T05:30:00+00:00",
+        },
+        {
+            "status": "ok",
+            "agent_id": "demo-agent",
+            "mode": "user",
+            "last_seen_at": "2026-08-29T05:30:00",
+        },
+    ],
+)
+def test_heartbeat_rejects_mismatched_or_untrusted_receipt(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    body: dict[str, Any] | None,
+) -> None:
+    token = "do-not-log-this-token"
+    event_logger = EventLogger(
+        store=LocalEventStore(tmp_path),
+        dashboard_url="https://dashboard.test",
+        dashboard_token=token,
+        agent_id="demo-agent",
+    )
+    monkeypatch.setattr(
+        event_logger_module.requests,
+        "post",
+        lambda *args, **kwargs: _Response(body=body),
+    )
+
+    with caplog.at_level("WARNING", logger="core_comm.event_logger"):
+        assert event_logger.send_heartbeat("user", "0.1.0") is False
+
+    assert token not in caplog.text
+
+
+def test_heartbeat_rejects_invalid_mode_before_network(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    post = Mock()
+    monkeypatch.setattr(event_logger_module.requests, "post", post)
+    event_logger = EventLogger(
+        store=LocalEventStore(tmp_path),
+        dashboard_url="https://dashboard.test",
+        dashboard_token="token",
+    )
+
+    assert event_logger.send_heartbeat("invalid", "0.1.0") is False
+    post.assert_not_called()
 
 
 def test_immediate_post_retries_until_success(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:

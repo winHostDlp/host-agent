@@ -44,6 +44,7 @@ from network_hook.file_inspector import FileInspector
 from network_hook.proxy_cert import ProxyCert
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+AGENT_VERSION = "0.1.0"
 
 
 # ── 설정 로더 ──────────────────────────────────────────────────────────────────
@@ -112,6 +113,29 @@ def _batch_flush_interval(settings: dict[str, Any]) -> float:
     return interval
 
 
+def _heartbeat_interval(settings: dict[str, Any]) -> float:
+    """Return the agent heartbeat interval; zero disables it."""
+    agent_cfg = settings.get("agent", {})
+    if not isinstance(agent_cfg, dict):
+        raise ValueError("agent 설정은 mapping이어야 합니다.")
+    raw_interval = agent_cfg.get("heartbeat_interval_sec", 0)
+    if isinstance(raw_interval, bool) or not isinstance(raw_interval, (int, float)):
+        raise ValueError(
+            "agent.heartbeat_interval_sec은 0 또는 5 이상의 숫자여야 합니다."
+        )
+    interval = float(raw_interval)
+    if (
+        not math.isfinite(interval)
+        or interval < 0
+        or 0 < interval < 5
+        or interval > threading.TIMEOUT_MAX
+    ):
+        raise ValueError(
+            "agent.heartbeat_interval_sec은 0 또는 5 이상의 지원되는 유한한 숫자여야 합니다."
+        )
+    return interval
+
+
 def _dashboard_delivery_config(settings: dict[str, Any]) -> tuple[str, str]:
     """Resolve the delivery URL and token used by immediate and batch sends."""
     server_cfg = settings.get("server", {})
@@ -150,6 +174,7 @@ def build_event_logger(settings: dict[str, Any]) -> EventLogger:
     server_cfg = settings.get("server", {})
     agent_cfg  = settings.get("agent", {})
     batch_interval = _batch_flush_interval(settings)
+    heartbeat_interval = _heartbeat_interval(settings)
     dashboard_url, dashboard_token = _dashboard_delivery_config(settings)
 
     store = LocalEventStore(
@@ -158,7 +183,7 @@ def build_event_logger(settings: dict[str, Any]) -> EventLogger:
         text_preview_len=log_cfg.get("text_preview_len", 120),
     )
     send_now = bool(log_cfg.get("send_immediately", False))
-    delivery_requested = send_now or batch_interval > 0
+    delivery_requested = send_now or batch_interval > 0 or heartbeat_interval > 0
     configured_dashboard_url = (
         dashboard_url if delivery_requested and dashboard_url and dashboard_token else None
     )
@@ -197,6 +222,27 @@ def _run_batch_replay(
 
         # ponytail: every pass rescans JSONL history. Replace this with a durable
         # outbox cursor only when one pass approaches the configured interval.
+        if stop_event.wait(interval):
+            return
+
+
+def _run_heartbeat(
+    event_logger: EventLogger,
+    stop_event: "threading.Event",
+    interval: float,
+    mode: str,
+) -> None:
+    """Report liveness at startup and periodically until Agent shutdown."""
+    logger = logging.getLogger(__name__)
+    while not stop_event.is_set():
+        try:
+            event_logger.send_heartbeat(mode, AGENT_VERSION)
+        except Exception as exc:
+            # An unexpected client error must not terminate detection channels.
+            logger.warning(
+                "Agent heartbeat 실패(다음 주기 재시도): %s",
+                type(exc).__name__,
+            )
         if stop_event.wait(interval):
             return
 
@@ -587,6 +633,7 @@ def run(mode: str = "all", stop_event: Optional["threading.Event"] = None) -> No
 
     settings = load_settings()
     batch_interval = _batch_flush_interval(settings)
+    heartbeat_interval = _heartbeat_interval(settings)
     dashboard_url, dashboard_token = _dashboard_delivery_config(settings)
     setup_logging(settings.get("agent", {}).get("log_level", "INFO"))
     logger = logging.getLogger(__name__)
@@ -615,7 +662,7 @@ def run(mode: str = "all", stop_event: Optional["threading.Event"] = None) -> No
     )
 
     lifecycle_stop = stop_event or _threading.Event()
-    batch_thread: Optional["threading.Thread"] = None
+    workers: list["threading.Thread"] = []
     if batch_interval > 0 and dashboard_url and dashboard_token and not lifecycle_stop.is_set():
         batch_thread = _threading.Thread(
             target=_run_batch_replay,
@@ -624,10 +671,31 @@ def run(mode: str = "all", stop_event: Optional["threading.Event"] = None) -> No
             name="DashboardBatchReplay",
         )
         batch_thread.start()
+        workers.append(batch_thread)
         logger.info("대시보드 배치 재전송 ON (startup + %.0f초 주기)", batch_interval)
     elif batch_interval > 0:
         logger.warning(
             "대시보드 배치 재전송 OFF (dashboard_url과 dashboard_token이 모두 필요함)"
+        )
+
+    if (
+        heartbeat_interval > 0
+        and dashboard_url
+        and dashboard_token
+        and not lifecycle_stop.is_set()
+    ):
+        heartbeat_thread = _threading.Thread(
+            target=_run_heartbeat,
+            args=(event_logger, lifecycle_stop, heartbeat_interval, mode),
+            daemon=True,
+            name="AgentHeartbeat",
+        )
+        heartbeat_thread.start()
+        workers.append(heartbeat_thread)
+        logger.info("Agent heartbeat ON (startup + %.0f초 주기)", heartbeat_interval)
+    elif heartbeat_interval > 0:
+        logger.warning(
+            "Agent heartbeat OFF (dashboard_url과 dashboard_token이 모두 필요함)"
         )
 
     logger.info("Sentry Host Agent running. Press Ctrl+C to stop.")
@@ -641,11 +709,14 @@ def run(mode: str = "all", stop_event: Optional["threading.Event"] = None) -> No
         shutdown_started = True
         logger.info("종료 중...")
         lifecycle_stop.set()
-        if batch_thread is not None and batch_thread.is_alive():
-            batch_thread.join(timeout=1.0)
-            if batch_thread.is_alive():
+        for worker in workers:
+            if not worker.is_alive():
+                continue
+            worker.join(timeout=1.0)
+            if worker.is_alive():
                 logger.warning(
-                    "배치 재전송을 1초 내에 종료하지 못해 daemon으로 남깁니다."
+                    "%s worker를 1초 내에 종료하지 못해 daemon으로 남깁니다.",
+                    worker.name,
                 )
         for ch in reversed(active):
             try:

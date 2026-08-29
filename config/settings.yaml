@@ -13,6 +13,8 @@ server:
 
 agent:
   log_level: "INFO"
+  # Web에 프로세스 생존 상태를 시작 직후와 주기마다 보고. 0이면 비활성화
+  heartbeat_interval_sec: 30
   # 정규식 패턴 파일 경로 (프로젝트 루트 기준)
   regex_patterns: "config/regex_patterns.json"
 

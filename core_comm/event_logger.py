@@ -237,6 +237,54 @@ class EventLogger:
         logger.info("flush_to_server 완료: %d건 전송", sent)
         return sent
 
+    def send_heartbeat(self, mode: str, agent_version: str) -> bool:
+        """Report current process liveness without queueing historical state."""
+        if mode not in {"user", "system", "all"}:
+            logger.warning("Agent heartbeat mode이 잘못되었습니다: %r", mode)
+            return False
+        if not self._dashboard_url or not self._token:
+            logger.warning("Agent heartbeat: dashboard_url과 dashboard_token이 필요합니다.")
+            return False
+
+        payload = {
+            "agent_id": self._agent_id,
+            "hostname": _HOSTNAME,
+            "agent_version": agent_version,
+            "mode": mode,
+        }
+        try:
+            response = requests.post(
+                f"{self._dashboard_url}/api/v1/agents/heartbeat",
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Agent-Token": self._token,
+                },
+                timeout=self._timeout,
+            )
+            response.raise_for_status()
+            receipt = response.json()
+            last_seen_at = (
+                receipt.get("last_seen_at") if isinstance(receipt, dict) else None
+            )
+            if (
+                not isinstance(receipt, dict)
+                or receipt.get("status") != "ok"
+                or receipt.get("agent_id") != self._agent_id
+                or receipt.get("mode") != mode
+                or not isinstance(last_seen_at, str)
+                or datetime.fromisoformat(last_seen_at).utcoffset() is None
+            ):
+                raise ValueError("Web heartbeat 영수증이 요청 신분과 다릅니다.")
+            logger.debug("Agent heartbeat stored mode=%s", mode)
+            return True
+        except Exception as exc:
+            logger.warning(
+                "Agent heartbeat 전송 실패(다음 주기 재시도): %s",
+                type(exc).__name__,
+            )
+            return False
+
     # ── Internals ─────────────────────────────────────────────────────────────
 
     def _build_log_payload(

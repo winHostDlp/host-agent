@@ -575,6 +575,52 @@ def test_batch_flush_interval_rejects_non_mapping_logging(monkeypatch):
         main_agent._batch_flush_interval({"logging": []})
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(0, 0.0), (5, 5.0), (30.5, 30.5)],
+)
+def test_heartbeat_interval_accepts_zero_or_at_least_five_seconds(
+    monkeypatch,
+    value,
+    expected,
+):
+    main_agent = _load_main_agent_without_windows_modules(monkeypatch)
+
+    assert main_agent._heartbeat_interval(
+        {"agent": {"heartbeat_interval_sec": value}}
+    ) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        True,
+        False,
+        -1,
+        1,
+        float("nan"),
+        float("inf"),
+        threading.TIMEOUT_MAX + 1,
+        "30",
+        None,
+    ],
+)
+def test_heartbeat_interval_rejects_invalid_values(monkeypatch, value):
+    main_agent = _load_main_agent_without_windows_modules(monkeypatch)
+
+    with pytest.raises(ValueError, match="heartbeat_interval_sec"):
+        main_agent._heartbeat_interval(
+            {"agent": {"heartbeat_interval_sec": value}}
+        )
+
+
+def test_heartbeat_interval_rejects_non_mapping_agent(monkeypatch):
+    main_agent = _load_main_agent_without_windows_modules(monkeypatch)
+
+    with pytest.raises(ValueError, match="agent"):
+        main_agent._heartbeat_interval({"agent": []})
+
+
 def test_batch_delivery_requires_both_dashboard_url_and_token(
     tmp_path,
     monkeypatch,
@@ -609,6 +655,37 @@ def test_batch_delivery_requires_both_dashboard_url_and_token(
     base["server"]["dashboard_token"] = ""
     main_agent.build_event_logger(base)
     assert captured[-1]["dashboard_url"] is None
+
+
+def test_heartbeat_alone_configures_event_logger_delivery(tmp_path, monkeypatch):
+    main_agent = _load_main_agent_without_windows_modules(monkeypatch)
+    monkeypatch.setattr(main_agent, "PROJECT_ROOT", tmp_path)
+    monkeypatch.delenv("AGENT_API_TOKEN", raising=False)
+    captured = {}
+
+    class CapturingEventLogger:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(main_agent, "EventLogger", CapturingEventLogger)
+    settings = {
+        "agent": {"heartbeat_interval_sec": 30},
+        "logging": {
+            "log_dir": "logs",
+            "send_immediately": False,
+            "batch_flush_interval_sec": 0,
+        },
+        "server": {
+            "dashboard_url": "https://dashboard.test",
+            "dashboard_token": "agent-token",
+        },
+    }
+
+    main_agent.build_event_logger(settings)
+
+    assert captured["dashboard_url"] == "https://dashboard.test"
+    assert captured["dashboard_token"] == "agent-token"
+    assert captured["send_immediately"] is False
 
 
 def test_batch_replay_starts_immediately_and_retries_after_failure(
@@ -647,10 +724,57 @@ def test_batch_replay_starts_immediately_and_retries_after_failure(
     assert "RuntimeError" in caplog.text
 
 
-def test_run_uses_shared_stop_event_and_bounded_batch_join(monkeypatch):
+def test_heartbeat_starts_immediately_and_retries_after_failure(
+    monkeypatch,
+    caplog,
+):
+    main_agent = _load_main_agent_without_windows_modules(monkeypatch)
+    event_logger = Mock()
+    event_logger.send_heartbeat.side_effect = [RuntimeError("offline"), True]
+
+    class TwoCycleStop:
+        def __init__(self):
+            self.stopped = False
+            self.waits = []
+
+        def is_set(self):
+            return self.stopped
+
+        def wait(self, timeout):
+            self.waits.append(timeout)
+            if len(self.waits) == 2:
+                self.stopped = True
+                return True
+            return False
+
+    stop_event = TwoCycleStop()
+    with caplog.at_level("WARNING"):
+        main_agent._run_heartbeat(event_logger, stop_event, 30, "user")
+
+    assert event_logger.send_heartbeat.call_count == 2
+    assert event_logger.send_heartbeat.call_args_list == [
+        (("user", main_agent.AGENT_VERSION),),
+        (("user", main_agent.AGENT_VERSION),),
+    ]
+    assert stop_event.waits == [30, 30]
+    assert "RuntimeError" in caplog.text
+
+
+def test_heartbeat_does_not_send_after_stop(monkeypatch):
+    main_agent = _load_main_agent_without_windows_modules(monkeypatch)
+    event_logger = Mock()
+    stop_event = threading.Event()
+    stop_event.set()
+
+    main_agent._run_heartbeat(event_logger, stop_event, 30, "system")
+
+    event_logger.send_heartbeat.assert_not_called()
+
+
+def test_run_uses_shared_stop_event_and_bounded_worker_joins(monkeypatch):
     main_agent = _load_main_agent_without_windows_modules(monkeypatch)
     settings = {
-        "agent": {},
+        "agent": {"heartbeat_interval_sec": 30},
         "logging": {"batch_flush_interval_sec": 60},
         "server": {
             "dashboard_url": "https://dashboard.test",
@@ -678,29 +802,37 @@ def test_run_uses_shared_stop_event_and_bounded_batch_join(monkeypatch):
     monkeypatch.setattr(main_agent.signal, "signal", Mock())
 
     stop_event = threading.Event()
-    thread_state = {}
+    workers = []
 
     class BoundedThread:
         def __init__(self, **kwargs):
-            thread_state.update(kwargs)
+            self.__dict__.update(kwargs)
+            self.join_timeout = None
+            workers.append(self)
 
         def start(self):
-            stop_event.set()
+            if len(workers) == 2:
+                stop_event.set()
 
         def is_alive(self):
             return True
 
         def join(self, timeout=None):
-            thread_state["join_timeout"] = timeout
+            self.join_timeout = timeout
 
     monkeypatch.setattr(main_agent.threading, "Thread", BoundedThread)
 
     main_agent.run(mode="system", stop_event=stop_event)
 
-    assert thread_state["name"] == "DashboardBatchReplay"
-    assert thread_state["daemon"] is True
-    assert thread_state["args"][1] is stop_event
-    assert thread_state["join_timeout"] == 1.0
+    assert [worker.name for worker in workers] == [
+        "DashboardBatchReplay",
+        "AgentHeartbeat",
+    ]
+    assert all(worker.daemon is True for worker in workers)
+    assert all(worker.args[1] is stop_event for worker in workers)
+    assert workers[0].args[2] == 60
+    assert workers[1].args[2:] == (30, "system")
+    assert all(worker.join_timeout == 1.0 for worker in workers)
     active_channel.stop.assert_called_once_with()
 
 

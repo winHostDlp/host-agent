@@ -66,6 +66,9 @@ server:
   dashboard_url: "http://<WEB_LAN_IP>:8000"
   dashboard_token: "<AGENT_API_TOKEN>"
 
+agent:
+  heartbeat_interval_sec: 30
+
 logging:
   send_immediately: true
   batch_flush_interval_sec: 60
@@ -128,6 +131,10 @@ JSONL 증거는 기본 `logs/server-pipeline-evidence/YYYY-MM-DD/<event_id>/even
 실시간 대시보드 전송은 채널 조치를 막지 않는 백그라운드 작업에서 최대 3회 짧게 재시도합니다. 모두 실패해도 이벤트는 먼저 기록된 로컬 JSONL에 남으며, Agent는 시작 직후와 `logging.batch_flush_interval_sec` 주기마다 활성·회전 로그(`events*.jsonl`)를 자동 재전송합니다. 주기는 `0`으로 비활성화하거나 5초 이상의 유한한 숫자로 설정하며, 다른 값은 Agent를 시작하지 않고 설정 오류로 처리합니다. `dashboard_url`과 `dashboard_token`이 모두 있을 때만 주기 재전송을 시작하며, 재전송 실패는 채널 감시·판정·로컬 저장을 중단하지 않습니다.
 
 자동 재전송은 로컬 감사 로그를 삭제·수정하지 않고 매번 전체 이력을 읽습니다. user/system 두 프로세스를 동시 운영하면 같은 로컬 로그를 둘 다 재전송할 수 있지만, Web이 안정적인 `event_id`를 중복 저장하지 않아 행이 중복되지는 않습니다. `successful_posts`는 Web 영수증의 동일한 `event_id`, 양의 `log_id`, boolean `duplicate`까지 검증한 건수입니다. 이 구조는 영속 cursor나 fleet 전송 큐가 아닙니다. 로그 양이 커져 한 번의 전체 순회가 설정 주기에 근접하면 그때 영속 cursor/outbox로 전환해야 합니다. 즉시 수동 확인은 아래 명령을 계속 사용할 수 있습니다.
+
+Agent는 시작 직후와 `agent.heartbeat_interval_sec` 주기마다 Web의 `/api/v1/agents/heartbeat`에 프로세스 생존 상태를 보냅니다. 기본 주기는 30초이고 `0`으로 비활성화하거나 5초 이상의 유한한 숫자로 설정합니다. 전송 내용은 `agent_id`, 호스트명, Agent 버전, 실행 모드(`user`/`system`/`all`)뿐이며 토큰은 `X-Agent-Token` 헤더로만 전달합니다. 실패하면 다음 주기에 다시 시도하고 채널 감시·판정·로컬 이벤트 저장에는 영향을 주지 않습니다. 종료 시 별도 heartbeat를 보내거나 실패분을 큐에 저장하지 않습니다.
+
+Web은 같은 `agent_id`라도 실행 모드별로 상태를 구분하며 마지막 heartbeat 후 90초가 지나면 stale로 표시합니다. heartbeat는 해당 프로세스가 최근 실행됐다는 신호일 뿐, 각 Windows 훅이나 AI·Web 전체 경로가 정상이라는 증거는 아닙니다. 실제 Windows/LAN 시연 검증은 위 사전 점검과 채널별 E2E 확인을 별도로 수행해야 합니다.
 
 신규로 생성되는 `logs/events*.jsonl`은 검사 원문과 `text_preview`를 저장하지 않고 `text_sha256`만 기록합니다. 호환성을 위해 `logging.text_preview_len` 설정은 계속 받지만 신규 로그 내용에는 영향을 주지 않습니다. 이전 버전이 생성한 JSONL에는 원문 미리보기가 남아 있을 수 있으며, 이런 기존 로그도 재전송은 가능하지만 자동 수정·삭제되지 않습니다. 로그는 계속 Git에서 제외하고, 시연에는 가상 데이터만 사용하세요.
 
