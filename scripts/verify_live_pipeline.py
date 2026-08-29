@@ -116,6 +116,7 @@ def _read_ai_health(ai_url: str, ai_token: str, timeout: float) -> dict[str, Any
         raise PipelineError("AI_HEALTH_FAILED") from exc
 
     checkpoint_sha256 = health.get("checkpoint_sha256")
+    model_bundle_sha256 = health.get("model_bundle_sha256")
     block_threshold = _finite_number(
         health.get("block_threshold"), "AI_HEALTH_INVALID"
     )
@@ -128,11 +129,14 @@ def _read_ai_health(ai_url: str, ai_token: str, timeout: float) -> dict[str, Any
         or health.get("auth_required") is not True
         or not isinstance(checkpoint_sha256, str)
         or SHA256_PATTERN.fullmatch(checkpoint_sha256) is None
+        or not isinstance(model_bundle_sha256, str)
+        or SHA256_PATTERN.fullmatch(model_bundle_sha256) is None
         or not 0.0 <= review_threshold < block_threshold <= 1.0
     ):
         raise PipelineError("AI_HEALTH_INVALID")
     return {
         "checkpoint_sha256": checkpoint_sha256,
+        "model_bundle_sha256": model_bundle_sha256,
         "block_threshold": block_threshold,
         "review_threshold": review_threshold,
     }
@@ -183,6 +187,7 @@ def _bind_ood_result(path: Path | None, ai_health: dict[str, Any]) -> dict[str, 
     )
     if (
         result.get("checkpoint_sha256") != ai_health["checkpoint_sha256"]
+        or result.get("model_bundle_sha256") != ai_health["model_bundle_sha256"]
         or block_threshold != ai_health["block_threshold"]
         or review_threshold != ai_health["review_threshold"]
         or not 0.0 <= f1 <= 1.0
@@ -431,7 +436,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         help=(
             "Optional blind OOD aggregate JSON. It must pass the evaluator quality "
-            "contract and match the live AI checkpoint and thresholds."
+            "contract and match the live AI checkpoint, model bundle, and thresholds."
         ),
     )
     args = parser.parse_args(argv)

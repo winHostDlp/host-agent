@@ -23,6 +23,7 @@ VIEWER_AUTHORIZATION = "Basic " + base64.b64encode(
     f"{VIEWER_USERNAME}:{VIEWER_PASSWORD}".encode()
 ).decode()
 CHECKPOINT_SHA256 = "a" * 64
+MODEL_BUNDLE_SHA256 = "c" * 64
 BLOCK_THRESHOLD = 0.41
 REVIEW_THRESHOLD = 0.20
 
@@ -97,6 +98,7 @@ def _handler(state: dict[str, Any]) -> type[BaseHTTPRequestHandler]:
                     "engine": "koelectra-dlp-v7",
                     "auth_required": True,
                     "checkpoint_sha256": CHECKPOINT_SHA256,
+                    "model_bundle_sha256": MODEL_BUNDLE_SHA256,
                     "block_threshold": BLOCK_THRESHOLD,
                     "review_threshold": REVIEW_THRESHOLD,
                 }
@@ -198,6 +200,7 @@ def _valid_ood_result(**overrides: Any) -> dict[str, Any]:
         "model_version": "koelectra-dlp-v7",
         "quality_passed": True,
         "checkpoint_sha256": CHECKPOINT_SHA256,
+        "model_bundle_sha256": MODEL_BUNDLE_SHA256,
         "block_threshold": BLOCK_THRESHOLD,
         "review_threshold": REVIEW_THRESHOLD,
         "minimum_f1": 0.90,
@@ -266,6 +269,7 @@ def test_live_pipeline_uses_real_http_headers_and_one_event_id(
     assert output["windows_hook_e2e"] is False
     assert output["model_version"] == "koelectra-dlp-v7"
     assert output["checkpoint_sha256"] == CHECKPOINT_SHA256
+    assert output["model_bundle_sha256"] == MODEL_BUNDLE_SHA256
     assert output["block_threshold"] == BLOCK_THRESHOLD
     assert output["review_threshold"] == REVIEW_THRESHOLD
     assert output["ood_bound"] is False
@@ -307,6 +311,7 @@ def test_live_pipeline_uses_real_http_headers_and_one_event_id(
     assert evidence_record["hits"][0]["id"] == verify_live_pipeline.MARKER_PATTERN_ID
     assert evidence_record["extra"]["event_id"] == output["event_id"]
     assert evidence_record["extra"]["checkpoint_sha256"] == CHECKPOINT_SHA256
+    assert evidence_record["extra"]["model_bundle_sha256"] == MODEL_BUNDLE_SHA256
     assert evidence_record["extra"]["block_threshold"] == BLOCK_THRESHOLD
     assert evidence_record["extra"]["review_threshold"] == REVIEW_THRESHOLD
     assert evidence_record["extra"]["ood_bound"] is False
@@ -325,6 +330,8 @@ def test_live_pipeline_uses_real_http_headers_and_one_event_id(
         ),
         ({"ai_health_overrides": {"auth_required": False}}, "AI_HEALTH_INVALID"),
         ({"ai_health_overrides": {"checkpoint_sha256": "A" * 64}}, "AI_HEALTH_INVALID"),
+        ({"ai_health_overrides": {"model_bundle_sha256": None}}, "AI_HEALTH_INVALID"),
+        ({"ai_health_overrides": {"model_bundle_sha256": "C" * 64}}, "AI_HEALTH_INVALID"),
         ({"ai_health_overrides": {"block_threshold": True}}, "AI_HEALTH_INVALID"),
         (
             {"ai_health_overrides": {"review_threshold": BLOCK_THRESHOLD}},
@@ -483,6 +490,8 @@ def test_live_pipeline_binds_a_passed_ood_result_to_live_health(
     assert output["ood_bound"] is True
     assert output["ood_result_sha256"] == hashlib.sha256(ood_path.read_bytes()).hexdigest()
     evidence = json.loads(Path(output["evidence_path"]).read_text(encoding="utf-8"))
+    assert output["model_bundle_sha256"] == MODEL_BUNDLE_SHA256
+    assert evidence["extra"]["model_bundle_sha256"] == MODEL_BUNDLE_SHA256
     assert evidence["extra"]["ood_bound"] is True
     assert evidence["extra"]["ood_result_sha256"] == output["ood_result_sha256"]
 
@@ -502,6 +511,7 @@ def test_live_pipeline_binds_a_passed_ood_result_to_live_health(
         {"metrics": {"f1": 0.89, "recall": 0.96}},
         {"metrics": {"f1": 0.95, "recall": 0.89}},
         {"checkpoint_sha256": "b" * 64},
+        {"model_bundle_sha256": "d" * 64},
         {"block_threshold": 0.42},
         {"review_threshold": 0.19},
         {"block_threshold": True},
