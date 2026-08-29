@@ -99,6 +99,20 @@ Windows PC에서 AI 서버와 원격 대시보드를 먼저 실행한 뒤 다음
 
 사전 점검의 `exit 0`은 설정과 로컬 실행 조건이 준비됐다는 뜻일 뿐, 실제 Windows 훅·AI 판정·대시보드 기록을 연결한 E2E 완료 증거가 아닙니다. 발표 전에는 각 채널의 실제 동작과 동일한 `event_id`의 대시보드 기록을 별도로 확인하세요.
 
+### 서버 파이프라인 실연동 확인
+
+실제 AI·Web URL과 토큰을 `settings.local.yaml` 또는 환경변수에 설정한 뒤 합성 마커 1건을 전송합니다. Web이 조회 API를 HTTP Basic으로 보호하면 `DASHBOARD_VIEWER_USERNAME`과 `DASHBOARD_VIEWER_PASSWORD`를 둘 다 설정하세요. 두 값은 ASCII여야 하고 username에 `:`을 넣을 수 없으며 password는 16자 이상이어야 합니다. 보호하지 않으면 둘 다 설정하지 않습니다. 한쪽만 설정되거나 형식이 다르면 네트워크 요청 전 `WEB_CONFIG_INVALID`로 중단합니다. 이 명령은 Web에 시험 로그 1건을 실제로 저장하므로 발표용 서버에서만 실행하세요.
+
+```powershell
+.\.venv\Scripts\python.exe scripts\verify_live_pipeline.py
+```
+
+검증 경로는 `실제 AI POST 및 koelectra-dlp-v7/event_id 응답 확인 → Host JSONL 기록 → Web POST 영수증 → GET 재조회`입니다. 성공 출력에는 동일한 `event_id`, 모델·조치 결과, `ai_rtt_ms`, `event_to_jsonl_ms`, `web_ack_ms`, `evidence_path`, `evidence_sha256` 등 안전한 검증값만 포함하고 토큰·마커 원문은 출력하지 않습니다. 어느 단계든 계약이 다르거나 HTTP·저장·재조회가 실패하면 non-zero로 종료합니다.
+
+JSONL 증거는 기본 `logs/server-pipeline-evidence/YYYY-MM-DD/<event_id>/events.jsonl`에 보존됩니다. 다른 루트가 필요하면 `--evidence-root <directory>`를 사용하세요. 상대 경로는 프로젝트 루트 기준입니다. JSONL이 생성되면 성공·Web 단계 실패 결과에 파일의 SHA-256을 `evidence_sha256`으로 표시하므로, 후속 검토 전에 변경 여부를 확인할 수 있습니다. 도구는 기존 `event_id` 폴더를 덮어쓰거나 지우지 않고, 성공·Web 실패 모두 보존된 경로를 결과에 표시합니다. 서버 복구 후에는 명령을 다시 실행해 새 `event_id`로 검증하고, 기존 증거는 자동 재전송·삭제되지 않습니다. 삭제가 필요하면 조원 확인 및 사용자 승인 후 출력된 해당 `<event_id>` 폴더 하나만 수동으로 삭제하세요.
+
+출력의 `scope=SERVER_PIPELINE`, `windows_hook_e2e=false`가 범위입니다. 이 검사는 macOS에서도 서버 공통 경로를 검증할 수 있지만 Clipboard·USB·Outlook·WebProxy 등 Windows 훅과 실제 사용자 조치를 시험하지 않습니다. 따라서 5개 발표 채널의 Windows Host→AI→Web E2E 증거로 대체하면 안 됩니다.
+
 실시간 대시보드 전송은 채널 조치를 막지 않는 백그라운드 작업에서 최대 3회 짧게 재시도합니다. 모두 실패한 이벤트는 자동 재전송되지 않고 로컬 JSONL에만 남습니다. 네트워크 복구 후 다음 명령으로 활성·회전 로컬 로그(`events*.jsonl`)를 명시적으로 재전송하고, `attempted`와 `successful_posts`가 같은지 확인하세요. `successful_posts`는 Web 저장 응답의 동일한 `event_id`, 양의 `log_id`, boolean `duplicate`까지 검증한 건수입니다. Web은 안정적인 `event_id`를 중복 저장하지 않습니다.
 
 `logs/events*.jsonl`에는 탐지 근거 미리보기가 포함될 수 있어 Git에서 제외합니다. 시연에는 가상 데이터만 사용하고, 공유·발표 전 로그 디렉터리를 확인하세요.
