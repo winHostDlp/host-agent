@@ -88,8 +88,8 @@ class _DLPHandler:
             await self._relay(envelope)
             return "250 OK"
 
-        summary = f"수신자: {', '.join(external)}"
-        decision = self._on_blocked(summary, hits, "smtp_proxy") or "block"
+        analysis_text = f"수신자: {', '.join(external)}\n\n{text}"
+        decision = self._on_blocked(analysis_text, hits, "smtp_proxy") or "block"
         if decision != "block":
             await self._relay(envelope)
             logger.warning(
@@ -126,14 +126,14 @@ class _DLPHandler:
                     data = part.get_payload(decode=True) or b""
                     extracted = self._fi_extract(data, fname)
                     if extracted:
-                        parts.append(f"[첨부: {fname}]\n{extracted[:16_384]}")
+                        parts.append(f"[첨부: {fname}]\n{extracted}")
                 except Exception as exc:
                     logger.debug("첨부파일 추출 실패(%s): %s", fname, exc)
             elif ct in {"text/plain", "text/html"}:
                 try:
                     payload = part.get_payload(decode=True) or b""
                     charset = part.get_content_charset() or "utf-8"
-                    parts.append(payload.decode(charset, errors="replace")[:32_768])
+                    parts.append(payload.decode(charset, errors="replace"))
                 except Exception:
                     pass
 

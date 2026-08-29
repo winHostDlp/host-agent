@@ -8,8 +8,8 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import email as _email_lib
+import html
 import json
 import logging
 import re
@@ -50,6 +50,12 @@ def _infer_ext_from_ct(content_type: str) -> str:
     ct = content_type.lower().split(";")[0].strip()
     return _CT_TO_EXT.get(ct, "")
 
+
+def _safe_url(raw_url: str) -> str:
+    """Keep routing context without persisting query credentials or fragments."""
+    parsed = urlparse(raw_url)
+    return parsed._replace(query="", fragment="").geturl()
+
 logger = logging.getLogger(__name__)
 
 # 차단 시 브라우저에 보여줄 HTML
@@ -85,9 +91,6 @@ _BLOCK_HTML = """\
 
 class _DLPAddon:
     """mitmproxy 애드온 클래스 — POST/PUT 요청을 가로채 DLP 파이프라인 실행."""
-
-    # 가로채기 로그에 붙일 본문 미리보기 길이 (원문 전체 덤프 방지)
-    _BODY_PREVIEW = 160
 
     # 같은 호스트에서 팝업을 중복 발생시키지 않을 시간(초) — Gmail 장기 재시도 커버
     _POPUP_DEDUP_SEC = 600  # 10분
@@ -145,6 +148,7 @@ class _DLPAddon:
             # ── 업로드 관련 요청 사전 로그 (도메인 파악용) ──────────────────
             url = flow.request.pretty_url
             url_lower = url.lower()
+            safe_url = _safe_url(url)
             host = flow.request.pretty_host.lower()
             if self._is_drive_target(host) and flow.request.method in ("POST", "PUT", "PATCH"):
                 cmd = flow.request.headers.get("x-goog-upload-command", "")
@@ -153,7 +157,7 @@ class _DLPAddon:
                     flow.request.method,
                     len(flow.request.content or b""),
                     cmd or "-",
-                    url[:200],
+                    safe_url[:200],
                 )
             elif self._is_target(host) and any(
                 p in url_lower for p in ("upload_id=", "/_/upload", "/upload/drive/")
@@ -162,7 +166,7 @@ class _DLPAddon:
                     "[WebProxy] Upload 요청 수신: method=%s  size=%d  url=%s",
                     flow.request.method,
                     len(flow.request.content or b""),
-                    url[:200],
+                    safe_url[:200],
                 )
         except Exception:
             logger.debug("[WebProxy] 요청 사전 로그 실패", exc_info=True)
@@ -206,7 +210,7 @@ class _DLPAddon:
                 "[WebProxy] <- status=%s  %s %s  [%s]",
                 res.status_code,
                 req.method,
-                req.pretty_url[:200],
+                _safe_url(req.pretty_url)[:200],
                 channel,
             )
         except Exception:
@@ -271,32 +275,17 @@ class _DLPAddon:
                 upload_id = parse_qs(urlparse(location).query).get("upload_id", [""])[0]
 
         meta = flow.metadata["_upload_init"]
-        location = res.headers.get("location", "")
-
-        # 응답 body 미리보기 — 실제 업로드 URL 파악용
-        resp_body_preview = ""
-        if res.content:
-            try:
-                resp_body_preview = res.content[:300].decode("utf-8", errors="ignore")
-            except Exception:
-                pass
-
         if upload_id:
             with self._upload_lock:
                 self._upload_meta[upload_id] = meta
             logger.info(
-                "[WebProxy] 업로드 세션 등록: id=%.24s  filename=%s  location=%s  resp_body=%s",
-                upload_id,
+                "[WebProxy] 업로드 세션 메타데이터 등록: filename=%s",
                 meta.get("filename") or "(미상)",
-                location[:120] or "(없음)",
-                resp_body_preview[:120] or "(없음)",
             )
         else:
             logger.info(
-                "[WebProxy] Upload init 응답 (upload_id 미확인): status=%s  location=%s  resp_body=%s",
+                "[WebProxy] Upload init 응답 (upload_id 미확인): status=%s",
                 res.status_code,
-                location[:160] or "(없음)",
-                resp_body_preview[:120] or "(없음)",
             )
 
     # ── 내부 로직 ─────────────────────────────────────────────────────────────
@@ -343,20 +332,10 @@ class _DLPAddon:
         logger.info(
             "[WebProxy] -> %s %s  bytes=%d  ct=%s",
             req.method,
-            req.pretty_url[:200],
+            _safe_url(req.pretty_url)[:200],
             len(body),
             ct,
         )
-
-        if body:
-            try:
-                preview = body.decode("utf-8", errors="replace")
-            except Exception:
-                preview = repr(body[: self._BODY_PREVIEW])
-            preview = preview.replace("\r", " ").replace("\n", " ")
-            if len(preview) > self._BODY_PREVIEW:
-                preview = preview[: self._BODY_PREVIEW] + "..."
-            logger.info("[WebProxy]    body preview: %s", preview)
 
     def _fallback_channel(self, flow) -> str:  # noqa: ANN001
         """분류기 예외 시 대상 도메인만으로 진단 이벤트 채널을 복구한다."""
@@ -384,7 +363,7 @@ class _DLPAddon:
         except Exception:
             host = "unknown"
         try:
-            url = flow.request.pretty_url
+            url = _safe_url(flow.request.pretty_url)
         except Exception:
             url = ""
         result = AnalysisResult(
@@ -421,11 +400,12 @@ class _DLPAddon:
 
         # 실제 파일 업로드 PUT 감지 — 명시적 로그
         url_lower = flow.request.pretty_url.lower()
+        safe_url = _safe_url(flow.request.pretty_url)
         if flow.request.method == "PUT" and "upload_id=" in url_lower:
             logger.info(
                 "[WebProxy] 파일 업로드 PUT 수신: size=%d  url=%s",
                 len(flow.request.content or b""),
-                flow.request.pretty_url[:180],
+                safe_url[:180],
             )
 
         if self._log_traffic:
@@ -436,7 +416,7 @@ class _DLPAddon:
             if self._log_traffic:
                 logger.info(
                     "[WebProxy]    DLP skip (empty text) url=%s",
-                    flow.request.pretty_url[:180],
+                    safe_url[:180],
                 )
             return
 
@@ -475,7 +455,7 @@ class _DLPAddon:
                     detection_type=(
                         "RULE_BASED" if getattr(self._api, "is_mock", True) else "HYBRID"
                     ),
-                    metadata={"url": flow.request.pretty_url},
+                    metadata={"url": safe_url},
                 )
             except Exception:
                 # 로컬 저장소·대시보드 기록 장애는 이미 확정된 HTTP 조치를 바꾸지 않는다.
@@ -500,24 +480,28 @@ class _DLPAddon:
 
         logger.info(
             "[WebProxy] AI 판단: action=%s confidence=%.2f url=%s",
-            result.action, result.confidence_score, flow.request.pretty_url,
+            result.action, result.confidence_score, safe_url,
         )
 
         if result.should_block:
             # 차단 응답을 먼저 확정한다. 이후 팝업이 실패해도 451은 유지된다.
             try:
                 pattern_names = ", ".join(h.get("name", h.get("id", "")) for h in hits)
-                html = _BLOCK_HTML.format(
-                    reason=result.reason or "민감정보 탐지",
-                    patterns=pattern_names,
+                block_html = _BLOCK_HTML.format(
+                    reason=html.escape(result.reason or "민감정보 탐지"),
+                    patterns=html.escape(pattern_names),
                 )
                 flow.response = Response.make(
                     451,
-                    html.encode("utf-8"),
+                    block_html.encode("utf-8"),
                     {
                         "Content-Type":  "text/html; charset=utf-8",
                         "X-DLP-Blocked": "1",
                         "Cache-Control": "no-store",
+                        "Content-Security-Policy": (
+                            "default-src 'none'; style-src 'unsafe-inline'; "
+                            "base-uri 'none'; frame-ancestors 'none'"
+                        ),
                     },
                 )
             except Exception as exc:
@@ -529,7 +513,7 @@ class _DLPAddon:
                 _record(replace(result, action="review", reason=reason))
                 logger.exception("[WebProxy] 451 응답 생성 실패 — WARNED 기록")
                 try:
-                    notify_review(channel, flow.request.pretty_url, hits)
+                    notify_review(channel, safe_url, hits)
                 except Exception:
                     logger.exception("[WebProxy] 451 실패 경고 표시 실패")
                 return
@@ -545,11 +529,11 @@ class _DLPAddon:
                     last = self._popup_cache.get(host, 0)
                     if now - last > self._POPUP_DEDUP_SEC:
                         self._popup_cache[host] = now
-                        self._on_blocked(flow.request.pretty_url, hits, process_name)
+                        self._on_blocked(safe_url, hits, process_name)
                     else:
                         logger.info(
                             "[WebProxy] 재시도 차단 (팝업 생략) url=%s",
-                            flow.request.pretty_url[:120],
+                            safe_url[:120],
                         )
                 except Exception:
                     logger.exception("[WebProxy] 차단 팝업 실패(451 차단 유지)")
@@ -558,14 +542,14 @@ class _DLPAddon:
         _record(result)
         if result.needs_review:
             try:
-                notify_review(channel, flow.request.pretty_url, hits)
+                notify_review(channel, safe_url, hits)
             except Exception:
                 logger.exception("[WebProxy] review 경고 실패(업로드 허용 유지)")
-            logger.warning("[WebProxy] review 기록 — %s", flow.request.pretty_url)
+            logger.warning("[WebProxy] review 기록 — %s", safe_url)
         elif result.analysis_failed:
-            logger.warning("[WebProxy] AI 장애 Fail-Open 기록 — 업로드 허용: %s", flow.request.pretty_url)
+            logger.warning("[WebProxy] AI 장애 Fail-Open 기록 — 업로드 허용: %s", safe_url)
         else:
-            logger.info("[WebProxy] AI allow 기록 — 업로드 허용: %s", flow.request.pretty_url)
+            logger.info("[WebProxy] AI allow 기록 — 업로드 허용: %s", safe_url)
         # allow/review → 그대로 통과
 
     # ── 도메인 매칭 ──────────────────────────────────────────────────────────
@@ -928,13 +912,6 @@ class _DLPAddon:
                 continue
 
             name = filename or inferred_name
-            encoding = (part.get("Content-Transfer-Encoding") or "").lower()
-            if "base64" in encoding:
-                try:
-                    payload = base64.b64decode(payload)
-                except Exception:
-                    pass
-
             if name and self._fi:
                 try:
                     extracted = self._fi.extract_from_bytes(payload, name)

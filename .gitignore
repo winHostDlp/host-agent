@@ -31,3 +31,7 @@ htmlcov/
 .env
 *.local.yaml
 config/internal_drives.local.json*
+
+# Runtime event logs may contain local DLP evidence and must never be committed.
+logs/*.jsonl
+logs/*.log

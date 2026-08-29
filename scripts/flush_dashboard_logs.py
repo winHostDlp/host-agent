@@ -1,4 +1,4 @@
-"""Replay the active local Host event log to the configured Web dashboard."""
+"""Replay active and rotated local Host event logs to the configured Web dashboard."""
 
 from __future__ import annotations
 
@@ -23,7 +23,23 @@ def _load_settings(project_root: Path) -> dict[str, Any]:
     settings = yaml.safe_load(settings_path.read_text(encoding="utf-8"))
     if not isinstance(settings, dict):
         raise ValueError("settings.yaml must contain a mapping")
+    local_path = project_root / "config" / "settings.local.yaml"
+    if local_path.exists():
+        local_settings = yaml.safe_load(local_path.read_text(encoding="utf-8"))
+        if not isinstance(local_settings, dict):
+            raise ValueError("settings.local.yaml must contain a mapping")
+        settings = _merge_settings(settings, local_settings)
     return settings
+
+
+def _merge_settings(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_settings(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def _build_logger(project_root: Path) -> EventLogger:
@@ -33,7 +49,11 @@ def _build_logger(project_root: Path) -> EventLogger:
     agent_cfg = settings.get("agent") or {}
 
     dashboard_url = str(server_cfg.get("dashboard_url") or "").strip()
-    dashboard_token = str(server_cfg.get("dashboard_token") or "").strip()
+    dashboard_token = str(
+        os.environ.get("AGENT_API_TOKEN")
+        or server_cfg.get("dashboard_token")
+        or ""
+    ).strip()
     if not dashboard_url:
         raise ValueError("server.dashboard_url is required")
     if not dashboard_token:
@@ -60,18 +80,20 @@ def _build_logger(project_root: Path) -> EventLogger:
     )
 
 
-def _active_record_count(logger: EventLogger) -> int:
-    active_path = logger._store._active_path
-    if not active_path.exists():
-        return 0
-    with active_path.open("r", encoding="utf-8") as stream:
-        return sum(1 for line in stream if line.strip())
+def _record_count(logger: EventLogger) -> int:
+    log_paths = sorted(logger._store._active_path.parent.glob("events*.jsonl"))
+    return sum(
+        1
+        for log_path in log_paths
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Replay logs/events.jsonl after dashboard connectivity is restored. "
+            "Replay active and rotated logs/events*.jsonl after dashboard connectivity is restored. "
             "The Web API deduplicates stable event_id values."
         )
     )
@@ -85,7 +107,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         logger = _build_logger(args.project_root.resolve())
-        attempted = _active_record_count(logger)
+        attempted = _record_count(logger)
         sent = logger.flush_to_server()
     except Exception as exc:
         print(f"[FAIL] Dashboard log replay could not start: {type(exc).__name__}: {exc}")
@@ -95,7 +117,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if sent != attempted:
         print("[FAIL] 일부 로그가 전송되지 않았습니다. 연결·토큰을 확인한 뒤 다시 실행하세요.")
         return 1
-    print("[PASS] 활성 로컬 로그 재전송 완료(Web event_id 중복 방지 적용).")
+    print("[PASS] 로컬 로그 재전송 완료(Web event_id 중복 방지 적용).")
     return 0
 
 

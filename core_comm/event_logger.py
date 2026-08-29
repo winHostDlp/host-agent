@@ -202,24 +202,25 @@ class EventLogger:
             logger.warning("flush_to_server: dashboard_url이 설정되지 않았습니다.")
             return 0
 
-        active = self._store._active_path
-        if not active.exists():
+        log_paths = sorted(self._store._active_path.parent.glob("events*.jsonl"))
+        if not log_paths:
             return 0
 
         sent = 0
-        with active.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                    # 로컬 레코드 → LogCreate 포맷 변환
-                    payload = self._build_log_payload_from_record(record)
-                    if self._post(payload):
-                        sent += 1
-                except Exception as exc:
-                    logger.warning("flush 중 오류 (건너뜀): %s", exc)
+        for log_path in log_paths:
+            with log_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                        # 로컬 레코드 → LogCreate 포맷 변환
+                        payload = self._build_log_payload_from_record(record)
+                        if self._post(payload):
+                            sent += 1
+                    except Exception as exc:
+                        logger.warning("flush 중 오류 (건너뜀): %s", exc)
 
         logger.info("flush_to_server 완료: %d건 전송", sent)
         return sent
@@ -291,7 +292,20 @@ class EventLogger:
         """flush_to_server용: 로컬 JSONL 레코드 → LogCreate 포맷 변환."""
         hits  = record.get("hits", [])
         extra = record.get("extra") or {}
-        extra.setdefault("event_id", record.get("event_id"))
+        if not extra.get("event_id"):
+            event_id = record.get("event_id")
+            if not event_id:
+                canonical_record = json.dumps(
+                    record,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                event_id = str(uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"sentry-local-event:{canonical_record}",
+                ))
+            extra["event_id"] = event_id
         extra.setdefault("_event_timestamp", record.get("timestamp"))
 
         return self._build_log_payload(

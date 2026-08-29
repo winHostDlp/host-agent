@@ -42,7 +42,6 @@ _FILE_STABLE_INTERVAL_SEC = 0.25
 _FILE_STABLE_SAMPLES     = 5
 _FILE_STABLE_TIMEOUT_SEC = 15.0
 _MAX_FILE_SIZE_BYTES     = 50 * 1024 * 1024
-_MIN_TEXT_LEN            = 20
 _DELETE_ACCESS           = 0x00010000
 _FILE_DISPOSITION_INFO_CLASS = 4
 _READ_CHUNK_BYTES        = 1024 * 1024
@@ -457,7 +456,7 @@ class UsbGuardUserMode:
                 logger.debug("[UsbGuard] 텍스트 추출 실패 %s: %s", file_path, exc)
                 return
 
-            if not text or len(text.strip()) < _MIN_TEXT_LEN:
+            if not text or not text.strip():
                 return
 
             hits = self._rf.match(text)

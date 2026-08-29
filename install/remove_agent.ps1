@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     Sentry DLP 에이전트(서비스 + Task Scheduler 작업)를 제거합니다.
@@ -11,15 +11,9 @@ function Write-Step([string]$msg) { Write-Host "[*] $msg" -ForegroundColor Cyan 
 function Write-OK  ([string]$msg) { Write-Host "[+] $msg" -ForegroundColor Green }
 function Write-Warn([string]$msg) { Write-Host "[~] $msg" -ForegroundColor Yellow }
 
-# 유저 에이전트 프로세스 종료
-Write-Step "유저 에이전트 프로세스 종료"
-Get-Process -Name "python" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -like "*sentry_user_agent*" } |
-    Stop-Process -Force -ErrorAction SilentlyContinue
-Write-OK "완료"
-
 # Task Scheduler 작업 제거
 Write-Step "Task Scheduler 작업 제거: $TaskName"
+Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 Write-OK "완료"
 

@@ -44,6 +44,26 @@ def test_flush_counts_all_successful_posts(tmp_path: Any, monkeypatch: pytest.Mo
     assert event_logger.flush_to_server() == 3
 
 
+def test_flush_replays_rotated_and_active_logs(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalEventStore(tmp_path)
+    store.write("clipboard", "allowed", "first.exe", [], extra={"event_id": "first"})
+    store._active_path.rename(tmp_path / "events.2026-08-29_010101.jsonl")
+    store.write("clipboard", "allowed", "second.exe", [], extra={"event_id": "second"})
+    posted = []
+    monkeypatch.setattr(
+        "core_comm.event_logger.requests.post",
+        lambda *args, **kwargs: posted.append(kwargs["json"]) or _Response(),
+    )
+
+    event_logger = EventLogger(store=store, dashboard_url="https://dashboard.test")
+
+    assert event_logger.flush_to_server() == 2
+    assert [item["event_id"] for item in posted] == ["first", "second"]
+
+
 def test_flush_does_not_count_failed_posts(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     event_logger = _logger_with_records(tmp_path, count=3)
     monkeypatch.setattr(
@@ -101,6 +121,30 @@ def test_flush_preserves_original_event_timestamp(
     assert posted[0]["timestamp"] == original["timestamp"]
 
 
+def test_legacy_record_without_event_id_replays_with_stable_id(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalEventStore(tmp_path)
+    store.write(
+        channel="clipboard",
+        action="allowed",
+        process_name="legacy.exe",
+        hits=[],
+    )
+    posted: list[str] = []
+    monkeypatch.setattr(
+        "core_comm.event_logger.requests.post",
+        lambda *args, **kwargs: posted.append(kwargs["json"]["event_id"]) or _Response(),
+    )
+    event_logger = EventLogger(store=store, dashboard_url="https://dashboard.test")
+
+    assert event_logger.flush_to_server() == 1
+    assert event_logger.flush_to_server() == 1
+    assert len(posted) == 2
+    assert posted[0] == posted[1]
+
+
 def test_immediate_post_retries_until_success(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     event_logger = _logger_with_records(tmp_path, count=0)
     post = Mock(side_effect=[False, False, True])
@@ -126,7 +170,7 @@ def test_immediate_post_stops_after_bounded_retries(
 
 
 @pytest.mark.parametrize(("post_error", "expected_exit"), [(None, 0), (RuntimeError("down"), 1)])
-def test_flush_cli_replays_active_log_and_reports_partial_failure(
+def test_flush_cli_replays_local_logs_and_reports_partial_failure(
     tmp_path: Any,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -167,3 +211,25 @@ logging:
     output = capsys.readouterr().out
     assert "attempted=1" in output
     assert f"successful_posts={1 if post_error is None else 0}" in output
+
+
+def test_flush_uses_local_settings_and_environment_token(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "settings.yaml").write_text(
+        "server:\n  dashboard_url: http://127.0.0.1:8000\n  dashboard_token: tracked\n",
+        encoding="utf-8",
+    )
+    (config / "settings.local.yaml").write_text(
+        "server:\n  dashboard_url: https://dashboard.local\n  dashboard_token: local\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_API_TOKEN", "environment-token")
+
+    logger = flush_dashboard_logs._build_logger(tmp_path)
+
+    assert logger._dashboard_url == "https://dashboard.local"
+    assert logger._token == "environment-token"

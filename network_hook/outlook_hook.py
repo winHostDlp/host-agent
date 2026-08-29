@@ -108,7 +108,7 @@ def _collect_text(
     # 본문
     try:
         body = item.Body or ""
-        parts.append(body[:32_768])  # 32 KB 상한
+        parts.append(body)
     except Exception:
         pass
 
@@ -117,17 +117,16 @@ def _collect_text(
         for i in range(1, item.Attachments.Count + 1):
             att = item.Attachments.Item(i)
             try:
-                import tempfile, os
+                import tempfile
                 suffix = Path(att.FileName).suffix
-                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
-                    tmp_path = tf.name
-                att.SaveAsFile(tmp_path)
-                data = Path(tmp_path).read_bytes()
-                os.unlink(tmp_path)
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    tmp_path = Path(tmp_dir) / f"attachment{suffix}"
+                    att.SaveAsFile(str(tmp_path))
+                    data = tmp_path.read_bytes()
 
                 text = file_inspector_extract(data, att.FileName)
                 if text:
-                    parts.append(f"[첨부: {att.FileName}]\n{text[:16_384]}")
+                    parts.append(f"[첨부: {att.FileName}]\n{text}")
             except Exception as exc:
                 logger.debug("첨부파일 추출 실패 (%s): %s", att.FileName, exc)
     except Exception:

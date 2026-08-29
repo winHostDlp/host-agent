@@ -124,7 +124,8 @@ class HttpMonitor:
             return
 
         dst = f"{packet.dst_addr}:{packet.dst_port}"
-        decision = self._on_blocked(f"HTTP POST → {dst}", hits, "http_upload") or "block"
+        analysis_text = f"HTTP POST → {dst}\n\n{text}"
+        decision = self._on_blocked(analysis_text, hits, "http_upload") or "block"
         if decision != "block":
             wd.send(packet)
             logger.warning("HTTP 업로드 %s 경고 기록 — 패킷 통과 → %s", decision, dst)
@@ -176,7 +177,7 @@ class HttpMonitor:
                 else:
                     decoded = p_body.decode("utf-8", errors="ignore")
                     if decoded.strip():
-                        parts.append(decoded[:32_768])
+                        parts.append(decoded)
 
             return "\n\n".join(parts) if parts else None
         except Exception as exc:

@@ -47,6 +47,34 @@ def test_setup_agent_is_ps51_safe_and_requires_explicit_start():
     assert '$ErrorActionPreference = "Stop"' in setup
 
 
+def test_proxy_setup_never_installs_into_global_python():
+    setup_path = Path(__file__).resolve().parents[1] / "install" / "setup_proxy.ps1"
+    setup = setup_path.read_text(encoding="utf-8-sig")
+
+    assert setup_path.read_bytes().startswith(b"\xef\xbb\xbf")
+    assert "pip install mitmproxy" not in setup
+    assert "Get-Command mitmdump" not in setup
+    assert ".venv\\Scripts\\python.exe" in setup
+    assert 'Join-Path (Split-Path $PythonExe -Parent) "mitmdump.exe"' in setup
+    assert setup.index("[System.IO.Path]::IsPathRooted") < setup.index("$isAdmin =")
+
+
+def test_remove_agent_stops_task_before_unregistering_it():
+    remove_path = Path(__file__).resolve().parents[1] / "install" / "remove_agent.ps1"
+    remove = remove_path.read_text(encoding="utf-8-sig")
+
+    assert remove_path.read_bytes().startswith(b"\xef\xbb\xbf")
+    assert remove.index("Stop-ScheduledTask") < remove.index("Unregister-ScheduledTask")
+    assert "Get-Process -Name" not in remove
+
+
+def test_runtime_event_logs_are_ignored():
+    root = Path(__file__).resolve().parents[1]
+    gitignore = (root / ".gitignore").read_text(encoding="utf-8")
+
+    assert "logs/*.jsonl" in gitignore
+
+
 def _load_usb_guard_with_win32_stubs(monkeypatch):
     win32api = ModuleType("win32api")
     win32con = ModuleType("win32con")

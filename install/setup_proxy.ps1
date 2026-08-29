@@ -1,8 +1,8 @@
-# Sentry Host Agent - HTTPS MITM proxy setup
+﻿# Sentry Host Agent - HTTPS MITM proxy setup
 # Must run as Administrator (for Root CA install).
 #
 # Steps:
-#   0) install mitmproxy (pip)
+#   0) verify mitmproxy in the selected project virtual environment
 #   1) generate mitmproxy CA if missing
 #   2) trust CA in Windows Root store
 #   3) set system proxy 127.0.0.1:<Port>
@@ -12,7 +12,7 @@
 
 param(
     [int]    $Port      = 8082,
-    [string] $PythonExe = "python"
+    [string] $PythonExe = (Join-Path (Split-Path $PSScriptRoot -Parent) ".venv\Scripts\python.exe")
 )
 
 $ErrorActionPreference = "Stop"
@@ -58,6 +58,15 @@ public class SentryWinINet {
     }
 }
 
+# Preserve a caller-provided relative venv path across UAC's working-directory change.
+if (-not [System.IO.Path]::IsPathRooted($PythonExe)) {
+    $PythonExe = [System.IO.Path]::GetFullPath(
+        (Join-Path (Get-Location).Path $PythonExe)
+    )
+} elseif (Test-Path -LiteralPath $PythonExe -PathType Leaf) {
+    $PythonExe = (Resolve-Path -LiteralPath $PythonExe).Path
+}
+
 # --- Admin check (auto-elevate via UAC prompt) ---
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -84,20 +93,25 @@ if (-not $isAdmin) {
     }
 }
 
-# --- 0. mitmproxy ---
-Write-Step 0 "Check mitmproxy install"
-$mitmdump = Get-Command mitmdump -ErrorAction SilentlyContinue
-if ($null -eq $mitmdump) {
-    Write-Host "    Installing mitmproxy via pip..."
-    & $PythonExe -m pip install mitmproxy
-    if ($LASTEXITCODE -ne 0) {
-        Write-Err "mitmproxy install failed"
-        exit 1
-    }
-    Write-OK "mitmproxy installed"
-} else {
-    Write-OK "mitmproxy already installed: $($mitmdump.Source)"
+# --- 0. project virtual environment / mitmproxy ---
+Write-Step 0 "Check project virtual environment and mitmproxy"
+if (-not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) {
+    Write-Err "Project Python not found: $PythonExe"
+    Write-Host "  Create .venv and install requirements before running this script."
+    exit 1
 }
+$mitmdumpPath = Join-Path (Split-Path $PythonExe -Parent) "mitmdump.exe"
+if (-not (Test-Path -LiteralPath $mitmdumpPath -PathType Leaf)) {
+    Write-Err "mitmdump.exe is not installed in the selected Python environment."
+    Write-Host "  Run: & `"$PythonExe`" -m pip install -r requirements.txt"
+    exit 1
+}
+& $PythonExe -c "import mitmproxy" 2>$null
+if ($LASTEXITCODE -ne 0) {
+    Write-Err "The selected Python environment cannot import mitmproxy."
+    exit 1
+}
+Write-OK "mitmproxy verified: $mitmdumpPath"
 
 # --- 1. CA generate ---
 Write-Step 1 "Generate mitmproxy CA certificate"
@@ -110,12 +124,7 @@ if (Test-Path $certFile) {
     Write-OK "CA already exists: $certFile"
 } else {
     Write-Host "    Running mitmdump briefly to create CA (wait 5 sec)..."
-    $mitmCmd = Get-Command mitmdump -ErrorAction SilentlyContinue
-    if ($null -eq $mitmCmd) {
-        Write-Err "mitmdump not found after install. Reopen PowerShell and retry."
-        exit 1
-    }
-    $proc = Start-Process -FilePath $mitmCmd.Source `
+    $proc = Start-Process -FilePath $mitmdumpPath `
         -ArgumentList @("--mode", "regular", "--set", "termlog_verbosity=warn") `
         -PassThru -WindowStyle Hidden
     Start-Sleep -Seconds 5

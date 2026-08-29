@@ -24,6 +24,18 @@ python -m venv .venv
 .\install\setup_agent.ps1 -PythonExe .\.venv\Scripts\python.exe
 ```
 
+웹메일·클라우드 업로드 시연을 할 때만 관리자 PowerShell에서 HTTPS 프록시를 별도로 설정합니다. 선택한 프로젝트 `.venv`에 `mitmproxy`가 없으면 전역 설치하지 않고 중단합니다.
+
+```powershell
+.\install\setup_proxy.ps1 -PythonExe .\.venv\Scripts\python.exe
+```
+
+시연 후에는 프록시·CA·QUIC 방화벽 규칙을 원복합니다.
+
+```powershell
+.\install\remove_proxy.ps1
+```
+
 `setup_agent.ps1`은 Windows PowerShell 5.1에서 실행할 수 있으며, 선택한 Python의 필수 런타임·파일 추출 모듈을 먼저 검증합니다. 모듈이 없거나 깨졌으면 시스템 Python에 자동 설치하지 않고 위와 같이 프로젝트 전용 venv에 `requirements.txt`를 설치하도록 안내한 뒤 안전하게 중단합니다. 설치 기본값은 예약 작업을 **비활성 상태로 등록만** 합니다. 기본 mock AI·loopback 대시보드 설정으로 호스트 제어가 먼저 시작되는 것을 막기 위한 조치입니다.
 
 발표용 기본 설치는 관리자 권한을 요구하지 않고 현재 사용자 전용
@@ -87,7 +99,9 @@ Windows PC에서 AI 서버와 원격 대시보드를 먼저 실행한 뒤 다음
 
 사전 점검의 `exit 0`은 설정과 로컬 실행 조건이 준비됐다는 뜻일 뿐, 실제 Windows 훅·AI 판정·대시보드 기록을 연결한 E2E 완료 증거가 아닙니다. 발표 전에는 각 채널의 실제 동작과 동일한 `event_id`의 대시보드 기록을 별도로 확인하세요.
 
-실시간 대시보드 전송은 채널 조치를 막지 않는 백그라운드 작업에서 최대 3회 짧게 재시도합니다. 모두 실패한 이벤트는 자동 재전송되지 않고 로컬 JSONL에만 남습니다. 네트워크 복구 후 다음 명령으로 활성 로컬 로그를 명시적으로 재전송하고, `attempted`와 `successful_posts`가 같은지 확인하세요. Web은 안정적인 `event_id`를 중복 저장하지 않습니다.
+실시간 대시보드 전송은 채널 조치를 막지 않는 백그라운드 작업에서 최대 3회 짧게 재시도합니다. 모두 실패한 이벤트는 자동 재전송되지 않고 로컬 JSONL에만 남습니다. 네트워크 복구 후 다음 명령으로 활성·회전 로컬 로그(`events*.jsonl`)를 명시적으로 재전송하고, `attempted`와 `successful_posts`가 같은지 확인하세요. Web은 안정적인 `event_id`를 중복 저장하지 않습니다.
+
+`logs/events*.jsonl`에는 탐지 근거 미리보기가 포함될 수 있어 Git에서 제외합니다. 시연에는 가상 데이터만 사용하고, 공유·발표 전 로그 디렉터리를 확인하세요.
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\flush_dashboard_logs.py

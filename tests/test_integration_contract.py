@@ -5,6 +5,7 @@ run in CI on non-Windows hosts.
 """
 
 import asyncio
+import base64
 import importlib.util
 import json
 import sys
@@ -35,9 +36,9 @@ from core_comm.payload_builder import (
 )
 from core_comm.review_notifier import build_review_notice
 from network_hook.http_monitor import HttpMonitor
-from network_hook.outlook_hook import _build_sink, _handle_item_send
+from network_hook.outlook_hook import _build_sink, _collect_text, _handle_item_send
 from network_hook.smtp_proxy import _DLPHandler
-from network_hook.web_proxy import _DLPAddon
+from network_hook.web_proxy import _DLPAddon, _safe_url
 
 
 def _analysis_payload() -> AnalysisPayload:
@@ -712,6 +713,53 @@ def test_http_review_reinjects_packet():
     sender.send.assert_called_once_with(packet)
 
 
+def test_http_ai_input_contains_destination_and_inspected_text():
+    captured = {}
+    packet = SimpleNamespace(
+        payload=b"POST /upload HTTP/1.1\r\nContent-Disposition: form-data",
+        dst_addr="203.0.113.10",
+        dst_port=80,
+    )
+    sender = SimpleNamespace(send=Mock())
+
+    def analyze(text, hits, process):
+        captured["text"] = text
+        return "allow"
+
+    monitor = HttpMonitor(
+        inspect_ports=[80],
+        inspect=lambda text: [{"id": "rrn"}],
+        on_blocked=analyze,
+        fi_extract=lambda data, name: None,
+    )
+    monitor._parse_multipart_text = lambda payload: "주민번호 900101-1234567"
+
+    monitor._handle_packet(packet, sender)
+
+    assert "203.0.113.10:80" in captured["text"]
+    assert "900101-1234567" in captured["text"]
+
+
+def test_http_collects_sensitive_text_beyond_old_slice_limit():
+    sensitive_value = "900101-1234567"
+    content = "A" * 32_768 + sensitive_value
+    boundary = "contract-boundary"
+    payload = (
+        f"POST /upload HTTP/1.1\r\n"
+        f"Content-Type: multipart/form-data; boundary={boundary}\r\n\r\n"
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="message"\r\n\r\n'
+        f"{content}\r\n"
+        f"--{boundary}--\r\n"
+    ).encode()
+    monitor = HttpMonitor([], Mock(), Mock(), Mock())
+
+    extracted = monitor._parse_multipart_text(payload)
+
+    assert extracted is not None
+    assert sensitive_value in extracted
+
+
 @pytest.mark.parametrize(
     ("decision", "expected_send_count"),
     [("block", 0), ("review", 1), ("allow", 1)],
@@ -842,6 +890,26 @@ def test_outlook_ai_payload_contains_inspected_body_and_attachment_content():
     assert request["metadata"]["app"] == "outlook.exe"
     assert request["matched_patterns"] == ["rrn"]
     assert [match.match for match in payload.matched_patterns] == [sensitive_value]
+
+
+def test_outlook_collects_sensitive_text_beyond_old_slice_limits():
+    sensitive_value = "900101-1234567"
+    body = "A" * 32_768 + sensitive_value
+    attachment = SimpleNamespace(
+        FileName="long.txt",
+        SaveAsFile=lambda path: Path(path).write_text(
+            "B" * 16_384 + sensitive_value,
+            encoding="utf-8",
+        ),
+    )
+    item = _outlook_mail_item(
+        body=body,
+        attachments=SimpleNamespace(Count=1, Item=lambda index: attachment),
+    )
+
+    collected = _collect_text(item, lambda data, name: data.decode("utf-8"))
+
+    assert collected.count(sensitive_value) == 2
 
 
 @pytest.mark.parametrize("decision", ["review", "allow", None, "unknown"])
@@ -997,6 +1065,33 @@ def _smtp_envelope():
             b"sensitive content"
         ),
     )
+
+
+def test_smtp_ai_input_contains_recipient_and_inspected_body():
+    captured = {}
+
+    def analyze(text, hits, process):
+        captured["text"] = text
+        return "allow"
+
+    handler = _DLPHandler(
+        internal_domains=frozenset({"internal.example"}),
+        relay_host="smtp.example",
+        relay_port=587,
+        relay_use_tls=True,
+        relay_username=None,
+        relay_password=None,
+        inspect=lambda text: [{"id": "rrn"}],
+        on_blocked=analyze,
+        fi_extract=lambda data, name: None,
+    )
+    handler._relay = AsyncMock()
+
+    response = asyncio.run(handler._process(_smtp_envelope()))
+
+    assert response.startswith("250")
+    assert "outside@example.com" in captured["text"]
+    assert "sensitive content" in captured["text"]
 
 
 @pytest.mark.parametrize(
@@ -1179,6 +1274,84 @@ def test_web_decision_survives_event_and_notifier_failures(
 
     actual_status = getattr(flow.response, "status_code", None)
     assert actual_status == expected_status
+
+
+def test_web_block_page_escapes_untrusted_reason_and_pattern(monkeypatch):
+    _install_fake_mitmproxy_response(monkeypatch)
+    addon = _DLPAddon(
+        inspect_domains=["mail.example"],
+        rule_filter=SimpleNamespace(
+            match=lambda text: [{"id": "rrn", "name": "<img src=x onerror=alert(1)>"}]
+        ),
+        payload_builder=SimpleNamespace(
+            build=lambda *args: SimpleNamespace(request_id="web-escaped-block")
+        ),
+        api_client=SimpleNamespace(
+            is_mock=False,
+            analyze=lambda payload: AnalysisResult(
+                request_id=payload.request_id,
+                confidence_score=0.9,
+                action="block",
+                reason="<script>window.pwned=1</script>",
+                model_version="koelectra-dlp-v7",
+            ),
+        ),
+        event_logger=Mock(),
+        file_inspector=Mock(),
+        log_traffic=False,
+    )
+    monkeypatch.setattr(addon, "_get_dlp_channel", lambda flow: "web_mail")
+    monkeypatch.setattr(addon, "_extract_text", lambda flow: "sensitive content")
+    flow = _web_flow()
+
+    addon._handle(flow)
+
+    block_page = flow.response.content.decode("utf-8")
+    assert "<script>" not in block_page
+    assert "<img src=x" not in block_page
+    assert "&lt;script&gt;" in block_page
+    assert "default-src 'none'" in flow.response.headers["Content-Security-Policy"]
+
+
+def test_web_logs_hide_body_and_url_query(caplog):
+    secret = "900101-1234567"
+    addon = _web_extract_addon(Mock())
+    flow = SimpleNamespace(
+        request=SimpleNamespace(
+            method="POST",
+            pretty_url="https://mail.example/upload?auth=secret-token#fragment",
+            pretty_host="mail.example",
+            content=secret.encode(),
+            headers={"content-type": "text/plain"},
+        )
+    )
+
+    with caplog.at_level("INFO"):
+        addon._log_send(flow)
+
+    assert secret not in caplog.text
+    assert "secret-token" not in caplog.text
+    assert _safe_url(flow.request.pretty_url) == "https://mail.example/upload"
+
+
+def test_web_multipart_base64_is_decoded_exactly_once():
+    secret = "AKIAIOSFODNN7EXAMPLE"
+    encoded = base64.b64encode(secret.encode("utf-8"))
+    boundary = "sentry-boundary"
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="file"; filename="secret.txt"\r\n'
+        "Content-Type: text/plain; charset=utf-8\r\n"
+        "Content-Transfer-Encoding: base64\r\n\r\n"
+    ).encode() + encoded + f"\r\n--{boundary}--\r\n".encode()
+    addon = _web_extract_addon(None)
+
+    extracted = addon._from_multipart(
+        body,
+        f"multipart/form-data; boundary={boundary}",
+    )
+
+    assert secret in extracted
 
 
 @pytest.mark.parametrize("failure_stage", ["build", "analyze"])
@@ -1593,6 +1766,22 @@ def test_usb_payload_failure_has_stable_fail_open_event_id(monkeypatch):
     assert logged["extra"]["detection_type"] == "RULE_BASED"
     assert state.handle.close_calls == 1
     state.disposition.assert_not_called()
+
+
+def test_usb_short_sensitive_text_is_still_analyzed_and_blocked(monkeypatch):
+    usb_guard = _load_usb_guard_with_win32_stubs(monkeypatch)
+    state = _usb_guard_for_decision(monkeypatch, usb_guard, decision="block")
+    state.file_inspector.extract_from_bytes.return_value = "900101-1234567"
+
+    state.guard._inspect_file(
+        "E:\\sensitive.txt",
+        "E:",
+        _USB_VOLUME_SERIAL,
+    )
+
+    state.api_client.analyze.assert_called_once()
+    state.disposition.assert_called_once()
+    assert state.event_logger.log.call_args.kwargs["action"] == "blocked"
 
 
 def test_usb_file_inspection_deduplicates_inflight_path(monkeypatch):
